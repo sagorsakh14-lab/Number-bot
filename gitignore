@@ -5,3 +5,4 @@ wa_sessions/
 numbers.txt
 *.log
 .env
+.DS_Store
