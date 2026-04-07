@@ -44,14 +44,15 @@ async function createWASession(userId, phoneNumber) {
 
   waSessions[userId] = { sock, isConnected: false };
   sock.ev.on("creds.update", saveCreds);
+
   sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
     if (connection === "open") {
       waSessions[userId].isConnected = true;
       console.log(`✅ WA connected: user ${userId}`);
     } else if (connection === "close") {
       waSessions[userId].isConnected = false;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      if (code === DisconnectReason.loggedOut || code === 401) {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
         try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
         delete waSessions[userId];
         console.log(`🔴 WA logged out: user ${userId}`);
@@ -59,8 +60,16 @@ async function createWASession(userId, phoneNumber) {
     }
   });
 
-  await new Promise(r => setTimeout(r, 3000));
-  const code = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ""));
+  // ✅ Baileys pairing code flow: socket ready হওয়ার পর 1.5s wait করো তারপর request করো
+  // (connection "open" এর আগেই request করতে হয় — এটাই WhatsApp এর সঠিক flow)
+  await new Promise(r => setTimeout(r, 1500));
+
+  // Phone number: শুধু digits, leading + বা 00 ছাড়া
+  const cleanPhone = phoneNumber.replace(/\D/g, "").replace(/^00/, "");
+  console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
+
+  const code = await sock.requestPairingCode(cleanPhone);
+  console.log(`🔑 Pairing code generated for user ${userId}`);
   return code;
 }
 
@@ -3944,38 +3953,52 @@ bot.on("text", async (ctx, next) => {
     // ── WA Connect: নম্বর input ──
     if (ctx.session.waConnectState === "waiting_number") {
       ctx.session.waConnectState = null;
-      const phone = text.replace(/\D/g, "");
+      // + এবং 00 prefix সরাও, শুধু digits রাখো
+      const phone = text.replace(/\D/g, "").replace(/^00/, "");
       if (phone.length < 10 || phone.length > 15) {
         return await ctx.reply("❌ Invalid number. Country code সহ দাও।\nExample: `8801712345678`", { parse_mode: "Markdown" });
       }
-      const loadMsg = await ctx.reply("⏳ *Connecting...*", { parse_mode: "Markdown" });
+      const loadMsg = await ctx.reply("⏳ *Connecting to WhatsApp...*\n_কিছুক্ষণ অপেক্ষা করো_", { parse_mode: "Markdown" });
       try {
         const rawCode = await createWASession(userId, phone);
-        const code = rawCode.match(/.{1,4}/g)?.join("-") || rawCode;
-        await ctx.telegram.deleteMessage(ctx.chat.id, loadMsg.message_id).catch(() => {});
-        await ctx.reply(
-          `🔑 *Pairing Code*\n\n` +
-          `\`${code}\`\n\n` +
-          `📋 *Steps:*\n` +
-          `1. WhatsApp খোলো\n` +
-          `2. Settings → Linked Devices\n` +
-          `3. Link a Device → *Link with phone number*\n` +
-          `4. উপরের code টা enter করো\n\n` +
-          `⏰ ১ মিনিটের মধ্যে expire হবে।`,
+        // Code কে XXXX-XXXX format এ দেখাও
+        const code = (rawCode || "").replace(/[^A-Z0-9]/gi, "").match(/.{1,4}/g)?.join("-") || rawCode;
+        await ctx.telegram.editMessageText(
+          ctx.chat.id, loadMsg.message_id, null,
+          `✅ *Connected! Pairing Code পাওয়া গেছে।*\n\n` +
+          `🔑 *Code:*\n\`${code}\`\n\n` +
+          `📋 *এখনই এই steps follow করো:*\n` +
+          `1️⃣ WhatsApp খোলো\n` +
+          `2️⃣ ⋮ Menu → Linked Devices\n` +
+          `3️⃣ Link a Device → *Link with phone number*\n` +
+          `4️⃣ উপরের code টা enter করো\n\n` +
+          `⏰ *Code ২ মিনিটের মধ্যে expire হবে!*`,
           {
             parse_mode: "Markdown",
             reply_markup: {
               inline_keyboard: [
-                [{ text: "✅ Check Status", callback_data: "wa_status" }],
-                [{ text: "🔄 New Code", callback_data: "wa_connect" }]
+                [{ text: "✅ Check Connection Status", callback_data: "wa_status" }],
+                [{ text: "🔄 নতুন Code নাও", callback_data: "wa_connect" }]
               ]
             }
           }
         );
       } catch(e) {
-        console.error("WA connect error:", e);
-        await ctx.telegram.deleteMessage(ctx.chat.id, loadMsg.message_id).catch(() => {});
-        await ctx.reply("❌ Connection failed. কিছুক্ষণ পর try করো।");
+        console.error("WA connect error:", e.message);
+        await ctx.telegram.editMessageText(
+          ctx.chat.id, loadMsg.message_id, null,
+          `❌ *Connection failed!*\n\n` +
+          `কারণ: ${e.message?.includes("timeout") ? "WhatsApp server respond করেনি" : "Connection error"}\n\n` +
+          `🔄 কিছুক্ষণ পর আবার try করো।`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "🔄 আবার try করো", callback_data: "wa_connect" }]
+              ]
+            }
+          }
+        ).catch(() => ctx.reply("❌ Connection failed. কিছুক্ষণ পর try করো।"));
       }
       return;
     }
