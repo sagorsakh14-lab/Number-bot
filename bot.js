@@ -22,6 +22,7 @@ async function createWASession(userId, phoneNumber) {
     try { waSessions[userId].sock.end(); } catch(e) {}
     delete waSessions[userId];
   }
+  
   const WA_SESSIONS_DIR = path.join(DATA_DIR, "wa_sessions");
   if (!fs.existsSync(WA_SESSIONS_DIR)) fs.mkdirSync(WA_SESSIONS_DIR, { recursive: true });
   const sessionDir = path.join(WA_SESSIONS_DIR, userId.toString());
@@ -45,32 +46,52 @@ async function createWASession(userId, phoneNumber) {
   waSessions[userId] = { sock, isConnected: false };
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
-    if (connection === "open") {
-      waSessions[userId].isConnected = true;
-      console.log(`✅ WA connected: user ${userId}`);
-    } else if (connection === "close") {
-      waSessions[userId].isConnected = false;
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
-        delete waSessions[userId];
-        console.log(`🔴 WA logged out: user ${userId}`);
-      }
-    }
-  });
-
-  // ✅ Baileys pairing code flow: socket ready হওয়ার পর 1.5s wait করো তারপর request করো
-  // (connection "open" এর আগেই request করতে হয় — এটাই WhatsApp এর সঠিক flow)
-  await new Promise(r => setTimeout(r, 1500));
-
-  // Phone number: শুধু digits, leading + বা 00 ছাড়া
+  // Clean phone number
   const cleanPhone = phoneNumber.replace(/\D/g, "").replace(/^00/, "");
   console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
 
-  const code = await sock.requestPairingCode(cleanPhone);
-  console.log(`🔑 Pairing code generated for user ${userId}`);
-  return code;
+  // Create promise that resolves when connection is open
+  let connectionTimeout = null;
+  
+  const connectionPromise = new Promise((resolve, reject) => {
+    connectionTimeout = setTimeout(() => {
+      reject(new Error("Connection timeout - WhatsApp not responding"));
+    }, 45000);
+
+    sock.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
+      if (connection === "open") {
+        clearTimeout(connectionTimeout);
+        waSessions[userId].isConnected = true;
+        console.log(`✅ WA connected: user ${userId}`);
+        
+        try {
+          // Request pairing code AFTER connection is open
+          const code = await sock.requestPairingCode(cleanPhone);
+          console.log(`🔑 Pairing code generated for user ${userId}`);
+          resolve(code);
+        } catch (err) {
+          reject(err);
+        }
+      } else if (connection === "close") {
+        clearTimeout(connectionTimeout);
+        waSessions[userId].isConnected = false;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+          try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
+          delete waSessions[userId];
+        }
+        reject(new Error(`Connection closed: ${lastDisconnect?.error?.message || 'Unknown'}`));
+      }
+    });
+  });
+
+  try {
+    const code = await connectionPromise;
+    return code;
+  } catch (err) {
+    console.error(`❌ WA connection failed for user ${userId}:`, err.message);
+    throw err;
+  }
 }
 
 function isWAConnected(userId) {
@@ -137,8 +158,8 @@ const ADMIN_PASSWORD = "sadhin8miya61458";
 const MAIN_CHANNEL = "@earning_hub_official_channel";
 const MAIN_CHANNEL_ID = -1003543718769; // numeric ID (not string)
 
-const CHAT_GROUP = "https://t.me/earning_hub_number_channel";
-const CHAT_GROUP_ID = -1003875142184; // your group exact ID
+const NUMBER_CHANNEL = "https://t.me/earning_hub_number_channel";
+const NUMBER_CHANNEL_ID = -1003875142184; // your group exact ID
 
 const OTP_GROUP = "https://t.me/EarningHub_otp";
 const OTP_GROUP_ID = -1003247504066; // your OTP group exact ID
@@ -853,7 +874,7 @@ async function checkUserMembership(ctx) {
     const userId = ctx.from.id;
 
     let isMainChannelMember = false;
-    let isChatGroupMember = false;
+    let isNumberChannelMember = false;
     let isOTPGroupMember = false;
     let checkFailed = false;
 
@@ -866,10 +887,10 @@ async function checkUserMembership(ctx) {
     }
 
     try {
-      const chatMember = await ctx.telegram.getChatMember(CHAT_GROUP_ID, userId);
-      isChatGroupMember = ['member', 'administrator', 'creator'].includes(chatMember.status);
+      const chatMember = await ctx.telegram.getChatMember(NUMBER_CHANNEL_ID, userId);
+      isNumberChannelMember = ['member', 'administrator', 'creator'].includes(chatMember.status);
     } catch (error) {
-      console.log("Chat group check error:", error.message);
+      console.log("Number channel check error:", error.message);
       checkFailed = true;
     }
 
@@ -881,13 +902,13 @@ async function checkUserMembership(ctx) {
       checkFailed = true;
     }
 
-    console.log(`Membership [${userId}]: main=${isMainChannelMember} chat=${isChatGroupMember} otp=${isOTPGroupMember} failed=${checkFailed}`);
+    console.log(`Membership [${userId}]: main=${isMainChannelMember} number=${isNumberChannelMember} otp=${isOTPGroupMember} failed=${checkFailed}`);
 
     return {
       mainChannel: isMainChannelMember,
-      chatGroup: isChatGroupMember,
+      numberChannel: isNumberChannelMember,
       otpGroup: isOTPGroupMember,
-      allJoined: isMainChannelMember && isChatGroupMember && isOTPGroupMember,
+      allJoined: isMainChannelMember && isNumberChannelMember && isOTPGroupMember,
       checkFailed
     };
 
@@ -895,7 +916,7 @@ async function checkUserMembership(ctx) {
     console.error("Membership check fatal error:", error);
     return {
       mainChannel: false,
-      chatGroup: false,
+      numberChannel: false,
       otpGroup: false,
       allJoined: false,
       checkFailed: true
@@ -921,7 +942,8 @@ bot.use(session({
     totpData: null,
     mailState: null,
     withdrawState: null,   // ← 'waiting_account' | 'confirm'
-    withdrawData: null     // ← { method, account, amount }
+    withdrawData: null,     // ← { method, account, amount }
+    waConnectState: null
   })
 }));
 
@@ -963,7 +985,8 @@ bot.use((ctx, next) => {
       totpData: null,
       mailState: null,
       withdrawState: null,
-      withdrawData: null
+      withdrawData: null,
+      waConnectState: null
     };
   }
 
@@ -1044,8 +1067,8 @@ bot.use(async (ctx, next) => {
           reply_markup: {
             inline_keyboard: [
               [{ text: "1️⃣ 📢 Main Channel", url: "https://t.me/earning_hub_official_channel" }],
-              [{ text: "2️⃣ 🌐 Number Channel", url: "https://t.me/earning_hub_number_channel" }],
-              [{ text: "3️⃣ 📨 OTP Group", url: "https://t.me/EarningHub_otp" }],
+              [{ text: "2️⃣ 🌐 Number Channel", url: NUMBER_CHANNEL }],
+              [{ text: "3️⃣ 📨 OTP Group", url: OTP_GROUP }],
               [{ text: "✅ VERIFY", callback_data: "verify_user" }]
             ]
           }
@@ -1065,8 +1088,8 @@ bot.use(async (ctx, next) => {
         reply_markup: {
           inline_keyboard: [
             [{ text: "1️⃣ 📢 Main Channel", url: "https://t.me/earning_hub_official_channel" }],
-            [{ text: "2️⃣ 🌐 Number Channel", url: "https://t.me/earning_hub_number_channel" }],
-            [{ text: "3️⃣ 📨 OTP Group", url: "https://t.me/EarningHub_otp" }],
+            [{ text: "2️⃣ 🌐 Number Channel", url: NUMBER_CHANNEL }],
+            [{ text: "3️⃣ 📨 OTP Group", url: OTP_GROUP }],
             [{ text: "✅ VERIFY", callback_data: "verify_user" }]
           ]
         }
@@ -1139,7 +1162,7 @@ bot.start(async (ctx) => {
         reply_markup: {
           inline_keyboard: [
             [{ text: "1️⃣ 📢 Main Channel", url: "https://t.me/earning_hub_official_channel" }],
-            [{ text: "2️⃣ 🌐 Number Channel", url: CHAT_GROUP }],
+            [{ text: "2️⃣ 🌐 Number Channel", url: NUMBER_CHANNEL }],
             [{ text: "3️⃣ 📨 OTP Group", url: OTP_GROUP }],
             [{ text: "✅ VERIFY MEMBERSHIP", callback_data: "verify_user" }]
           ]
@@ -1181,7 +1204,7 @@ bot.action("verify_user", async (ctx) => {
       let notJoinedMsg = "❌ *VERIFICATION FAILED*\n\nYou haven't joined the following groups:\n";
 
       if (!membership.mainChannel) notJoinedMsg += "❌ 1️⃣ Main Channel\n";
-      if (!membership.chatGroup) notJoinedMsg += "❌ 2️⃣ Number Channel\n";
+      if (!membership.numberChannel) notJoinedMsg += "❌ 2️⃣ Number Channel\n";
       if (!membership.otpGroup) notJoinedMsg += "❌ 3️⃣ OTP Group\n";
 
       notJoinedMsg += "\nPlease join ALL three groups and click VERIFY again.";
@@ -1805,7 +1828,7 @@ bot.action(/^withdraw_amount:([^:]+):(.+)$/, async (ctx) => {
     `${icon} *${method} - ${amount.toFixed(2)} taka*
 
 ` +
-    `📱 Your *${method} number:*
+    `📱 Your *${method} number:
 ` +
     `Example: \`01712345678\`
 
@@ -3223,7 +3246,7 @@ bot.on("chat_member", async (ctx) => {
     // Check if this is one of our required groups/channels
     const isRequiredGroup = (
       chatId === MAIN_CHANNEL_ID?.toString() ||
-      chatId === CHAT_GROUP_ID?.toString() ||
+      chatId === NUMBER_CHANNEL_ID?.toString() ||
       chatId === OTP_GROUP_ID?.toString()
     );
 
@@ -4322,7 +4345,7 @@ async function startBot() {
     console.log("🤖 Bot Token: [HIDDEN]");
     console.log("🔑 Admin Password: [HIDDEN]");
     console.log("📢 Main Channel ID: " + MAIN_CHANNEL_ID);
-    console.log("💬 Chat Group ID: " + CHAT_GROUP_ID);
+    console.log("💬 Number Channel ID: " + NUMBER_CHANNEL_ID);
     console.log("📨 OTP Group ID: " + OTP_GROUP_ID);
     console.log("⚙️ Default Number Count: " + settings.defaultNumberCount);
     console.log("=====================================");
@@ -4357,7 +4380,7 @@ async function startBot() {
       for (const userId of allUserIds) {
         try {
           let isMainChannelMember = false;
-          let isChatGroupMember = false;
+          let isNumberChannelMember = false;
           let isOTPGroupMember = false;
 
           try {
@@ -4366,8 +4389,8 @@ async function startBot() {
           } catch(e) {}
 
           try {
-            const m = await bot.telegram.getChatMember(CHAT_GROUP_ID, userId);
-            isChatGroupMember = ['member', 'administrator', 'creator'].includes(m.status);
+            const m = await bot.telegram.getChatMember(NUMBER_CHANNEL_ID, userId);
+            isNumberChannelMember = ['member', 'administrator', 'creator'].includes(m.status);
           } catch(e) {}
 
           try {
@@ -4375,7 +4398,7 @@ async function startBot() {
             isOTPGroupMember = ['member', 'administrator', 'creator'].includes(m.status);
           } catch(e) {}
 
-          const allJoined = isMainChannelMember && isChatGroupMember && isOTPGroupMember;
+          const allJoined = isMainChannelMember && isNumberChannelMember && isOTPGroupMember;
 
           if (!allJoined) {
             users[userId].verified = false;
@@ -4391,7 +4414,7 @@ async function startBot() {
                   reply_markup: {
                     inline_keyboard: [
                       [{ text: "1️⃣ 📢 Main Channel", url: MAIN_CHANNEL }],
-                      [{ text: "2️⃣ 💬 Chat Group", url: NUMBER_CHANNEL }],
+                      [{ text: "2️⃣ 🌐 Number Channel", url: NUMBER_CHANNEL }],
                       [{ text: "3️⃣ 📨 OTP Group", url: OTP_GROUP }],
                       [{ text: "✅ VERIFY", callback_data: "verify_user" }]
                     ]
@@ -4426,4 +4449,4 @@ async function startBot() {
 startBot();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'))
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
