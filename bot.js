@@ -12,6 +12,7 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  Browsers,
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 
@@ -25,6 +26,8 @@ async function createWASession(userId, phoneNumber) {
   const WA_SESSIONS_DIR = path.join(DATA_DIR, "wa_sessions");
   if (!fs.existsSync(WA_SESSIONS_DIR)) fs.mkdirSync(WA_SESSIONS_DIR, { recursive: true });
   const sessionDir = path.join(WA_SESSIONS_DIR, userId.toString());
+
+  // প্রতিবার fresh session — পুরনো data রাখলে pairing কাজ করে না
   if (fs.existsSync(sessionDir)) {
     try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
   }
@@ -41,52 +44,52 @@ async function createWASession(userId, phoneNumber) {
     },
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
-    browser: ["Ubuntu", "Chrome", "20.0.04"],  // ✅ FIX: correct browser format
+    browser: Browsers.ubuntu("Chrome"), // ✅ Baileys built-in browser — pairing এ এটাই কাজ করে
     syncFullHistory: false,
-    mobile: false,
   });
 
   waSessions[userId] = { sock, isConnected: false };
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
-    if (connection === "open") {
-      waSessions[userId].isConnected = true;
-      console.log(`✅ WA connected: user ${userId}`);
-    } else if (connection === "close") {
-      waSessions[userId].isConnected = false;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      if (code === DisconnectReason.loggedOut || code === 401) {
-        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
-        delete waSessions[userId];
-        console.log(`🔴 WA logged out: user ${userId}`);
-      }
-    }
-  });
+  const cleanPhone = phoneNumber.replace(/\D/g, "");
 
-  // ✅ FIX: Wait for socket to properly connect to WA server before requesting pairing code
-  await new Promise((resolve) => {
-    let resolved = false;
-    sock.ev.on("connection.update", ({ connection }) => {
-      if (!resolved && (connection === "connecting" || connection === "open")) {
-        resolved = true;
-        resolve();
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error("Timeout: WA server ৩০ সেকেন্ডে respond করেনি"));
+    }, 30000);
+
+    let codeSent = false;
+
+    sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
+      // ✅ KEY FIX: qr event মানে WA server ready — এই মুহূর্তেই pairing code চাইতে হবে
+      if (qr && !codeSent) {
+        codeSent = true;
+        clearTimeout(timeout);
+        try {
+          console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
+          const code = await sock.requestPairingCode(cleanPhone);
+          console.log(`🔑 Pairing code received: ${code}`);
+          resolve(code);
+        } catch(e) {
+          console.error("Pairing code error:", e.message);
+          reject(e);
+        }
+      }
+
+      if (connection === "open") {
+        waSessions[userId].isConnected = true;
+        console.log(`✅ WA connected: user ${userId}`);
+      } else if (connection === "close") {
+        waSessions[userId].isConnected = false;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+          try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
+          delete waSessions[userId];
+          console.log(`🔴 WA logged out: user ${userId}`);
+        }
       }
     });
-    // Fallback: wait 8 seconds max
-    setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, 8000);
   });
-
-  // Extra small delay after connection event
-  await new Promise(r => setTimeout(r, 1500));
-
-  const cleanPhone = phoneNumber.replace(/\D/g, "");
-  console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
-
-  const pairingCode = await sock.requestPairingCode(cleanPhone);
-  console.log(`🔑 Pairing code received: ${pairingCode}`);
-
-  return pairingCode;
 }
 
 function isWAConnected(userId) {
