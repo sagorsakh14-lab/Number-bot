@@ -63,7 +63,12 @@ async function createWASession(userId, phoneNumber) {
     delete waSessions[userId];
   }
   const sessionDir = path.join(WA_SESSIONS_DIR, userId.toString());
-  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+
+  // পুরনো session মুছো — না মুছলে pairing code invalid হয়
+  if (fs.existsSync(sessionDir)) {
+    try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
+  }
+  fs.mkdirSync(sessionDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
   const { version } = await fetchLatestBaileysVersion();
@@ -76,12 +81,14 @@ async function createWASession(userId, phoneNumber) {
     },
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
-    browser: ["Ubuntu", "Chrome", "20.0.04"],
+    browser: ["WhatsApp", "Chrome", "23.0.0.82"],
     syncFullHistory: false,
   });
 
   waSessions[userId] = { sock, isConnected: false };
   sock.ev.on("creds.update", saveCreds);
+
+  // connection.update handler — connected/disconnected track করে
   sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
     if (connection === "open") {
       waSessions[userId].isConnected = true;
@@ -97,9 +104,30 @@ async function createWASession(userId, phoneNumber) {
     }
   });
 
-  await new Promise(r => setTimeout(r, 3000));
-  const code = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ""));
-  return code;
+  // ✅ QR event আসলে WA server ready — এই মুহূর্তেই pairing code চাও
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("WA server সাড়া দেয়নি, আবার try করো।"));
+    }, 60000);
+
+    let pairingRequested = false;
+
+    sock.ev.on("connection.update", async ({ qr }) => {
+      if (qr && !pairingRequested) {
+        pairingRequested = true;
+        clearTimeout(timer);
+        try {
+          const cleanPhone = phoneNumber.replace(/\D/g, "");
+          console.log(`📱 Requesting pairing code: ${cleanPhone}`);
+          const code = await sock.requestPairingCode(cleanPhone);
+          console.log(`🔑 Code: ${code}`);
+          resolve(code);
+        } catch (e) {
+          reject(e);
+        }
+      }
+    });
+  });
 }
 
 function isWAConnected(userId) {
