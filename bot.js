@@ -5,33 +5,65 @@ const path = require("path");
 const https = require("https");
 const { authenticator } = require("otplib");
 
-/******************** WHATSAPP CHECK ********************/
+/******************** BAILEYS WHATSAPP ********************/
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-  Browsers,
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 
+/******************** YOUR CONFIGURATION ********************/
+const BOT_TOKEN = "8672122739:AAGXzye3H-78dPMswDLCzMLkkoimcDCqihY";
+const ADMIN_PASSWORD = "sadhin8miya61458";
+
+// ⚠️ IMPORTANT: Replace the IDs below with your actual IDs ⚠️
+// Use @getidsbot to find your IDs
+const MAIN_CHANNEL = "@earning_hub_official_channel";
+const MAIN_CHANNEL_ID = -1003543718769; // numeric ID (not string)
+
+const CHAT_GROUP = "https://t.me/earning_hub_number_channel";
+const CHAT_GROUP_ID = -1003875142184; // your group exact ID
+
+const OTP_GROUP = "https://t.me/EarningHub_otp";
+const OTP_GROUP_ID = -1003247504066; // your OTP group exact ID
+
+/******************** FILES ********************/
+// Railway Volume support - data persists across restarts
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH
+  ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH)
+  : __dirname;
+
+console.log(`📁 Data Directory: ${DATA_DIR}`);
+
+const NUMBERS_FILE = path.join(DATA_DIR, "numbers.txt");
+const COUNTRIES_FILE = path.join(DATA_DIR, "countries.json");
+const USERS_FILE = path.join(DATA_DIR, "users.json");
+const SERVICES_FILE = path.join(DATA_DIR, "services.json");
+const ACTIVE_NUMBERS_FILE = path.join(DATA_DIR, "active_numbers.json");
+const OTP_LOG_FILE = path.join(DATA_DIR, "otp_log.json");
+const ADMINS_FILE = path.join(DATA_DIR, "admins.json");
+const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
+const TOTP_SECRETS_FILE = path.join(DATA_DIR, "totp_secrets.json");
+const TEMP_MAILS_FILE = path.join(DATA_DIR, "temp_mails.json");
+const EARNINGS_FILE = path.join(DATA_DIR, "earnings.json");
+const WITHDRAW_FILE = path.join(DATA_DIR, "withdrawals.json");
+const COUNTRY_PRICES_FILE = path.join(DATA_DIR, "country_prices.json");
+
+/******************** WHATSAPP SESSION SETUP ********************/
 const waSessions = {}; // { userId: { sock, isConnected } }
+const WA_SESSIONS_DIR = path.join(DATA_DIR, "wa_sessions");
+if (!fs.existsSync(WA_SESSIONS_DIR)) fs.mkdirSync(WA_SESSIONS_DIR, { recursive: true });
 
 async function createWASession(userId, phoneNumber) {
   if (waSessions[userId]?.sock) {
     try { waSessions[userId].sock.end(); } catch(e) {}
     delete waSessions[userId];
   }
-  const WA_SESSIONS_DIR = path.join(DATA_DIR, "wa_sessions");
-  if (!fs.existsSync(WA_SESSIONS_DIR)) fs.mkdirSync(WA_SESSIONS_DIR, { recursive: true });
   const sessionDir = path.join(WA_SESSIONS_DIR, userId.toString());
-
-  // প্রতিবার fresh session — পুরনো data রাখলে pairing কাজ করে না
-  if (fs.existsSync(sessionDir)) {
-    try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
-  }
-  fs.mkdirSync(sessionDir, { recursive: true });
+  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
   const { version } = await fetchLatestBaileysVersion();
@@ -44,52 +76,30 @@ async function createWASession(userId, phoneNumber) {
     },
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
-    browser: Browsers.macOS("Safari"), // macOS Safari = WA notification trigger করে
+    browser: ["Ubuntu", "Chrome", "20.0.04"],
     syncFullHistory: false,
   });
 
   waSessions[userId] = { sock, isConnected: false };
   sock.ev.on("creds.update", saveCreds);
-
-  const cleanPhone = phoneNumber.replace(/\D/g, "");
-
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error("Timeout: WA server ৩০ সেকেন্ডে respond করেনি"));
-    }, 30000);
-
-    let codeSent = false;
-
-    sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
-      // ✅ KEY FIX: qr event মানে WA server ready — এই মুহূর্তেই pairing code চাইতে হবে
-      if (qr && !codeSent) {
-        codeSent = true;
-        clearTimeout(timeout);
-        try {
-          console.log(`📱 Requesting pairing code for: ${cleanPhone}`);
-          const code = await sock.requestPairingCode(cleanPhone);
-          console.log(`🔑 Pairing code received: ${code}`);
-          resolve(code);
-        } catch(e) {
-          console.error("Pairing code error:", e.message);
-          reject(e);
-        }
+  sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
+    if (connection === "open") {
+      waSessions[userId].isConnected = true;
+      console.log(`✅ WA connected: user ${userId}`);
+    } else if (connection === "close") {
+      if (waSessions[userId]) waSessions[userId].isConnected = false;
+      const code = lastDisconnect?.error?.output?.statusCode;
+      if (code === DisconnectReason.loggedOut || code === 401) {
+        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
+        delete waSessions[userId];
+        console.log(`🔴 WA logged out: user ${userId}`);
       }
-
-      if (connection === "open") {
-        waSessions[userId].isConnected = true;
-        console.log(`✅ WA connected: user ${userId}`);
-      } else if (connection === "close") {
-        waSessions[userId].isConnected = false;
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-          try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
-          delete waSessions[userId];
-          console.log(`🔴 WA logged out: user ${userId}`);
-        }
-      }
-    });
+    }
   });
+
+  await new Promise(r => setTimeout(r, 3000));
+  const code = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ""));
+  return code;
 }
 
 function isWAConnected(userId) {
@@ -111,9 +121,9 @@ async function checkWANumbers(userId, numbers) {
 }
 
 async function restoreWASessions() {
-  const WA_SESSIONS_DIR = path.join(DATA_DIR, "wa_sessions");
   if (!fs.existsSync(WA_SESSIONS_DIR)) return;
-  for (const uid of fs.readdirSync(WA_SESSIONS_DIR)) {
+  const userFolders = fs.readdirSync(WA_SESSIONS_DIR);
+  for (const uid of userFolders) {
     const sessionDir = path.join(WA_SESSIONS_DIR, uid);
     if (!fs.existsSync(path.join(sessionDir, "creds.json"))) continue;
     try {
@@ -124,7 +134,7 @@ async function restoreWASessions() {
         auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })) },
         printQRInTerminal: false,
         logger: pino({ level: "silent" }),
-        browser: ["Ubuntu", "Chrome", "20.0.04"],  // ✅ FIX: consistent browser format
+        browser: ["Ubuntu", "Chrome", "20.0.04"],
         syncFullHistory: false,
       });
       waSessions[uid] = { sock, isConnected: false };
@@ -134,7 +144,7 @@ async function restoreWASessions() {
           waSessions[uid].isConnected = true;
           console.log(`✅ WA restored: user ${uid}`);
         } else if (connection === "close") {
-          waSessions[uid].isConnected = false;
+          if (waSessions[uid]) waSessions[uid].isConnected = false;
           const code = lastDisconnect?.error?.output?.statusCode;
           if (code === DisconnectReason.loggedOut || code === 401) {
             try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
@@ -147,47 +157,13 @@ async function restoreWASessions() {
   }
 }
 
-/******************** YOUR CONFIGURATION ********************/
-const BOT_TOKEN = "8672122739:AAGXzye3H-78dPMswDLCzMLkkoimcDCqihY";
-const ADMIN_PASSWORD = "sadhin8miya61458";
-
-const MAIN_CHANNEL = "@earning_hub_official_channel";
-const MAIN_CHANNEL_ID = -1003543718769;
-
-const CHAT_GROUP = "https://t.me/earning_hub_number_channel";
-const CHAT_GROUP_ID = -1003875142184;
-
-const OTP_GROUP = "https://t.me/EarningHub_otp";
-const OTP_GROUP_ID = -1003247504066;
-
-/******************** FILES ********************/
-const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH
-  ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH)
-  : __dirname;
-
-console.log(`📁 Data Directory: ${DATA_DIR}`);
-
-const NUMBERS_FILE = path.join(DATA_DIR, "numbers.txt");
-const COUNTRIES_FILE = path.join(DATA_DIR, "countries.json");
-const USERS_FILE = path.join(DATA_DIR, "users.json");
-const SERVICES_FILE = path.join(DATA_DIR, "services.json");
-const ACTIVE_NUMBERS_FILE = path.join(DATA_DIR, "active_numbers.json");
-const OTP_LOG_FILE = path.join(DATA_DIR, "otp_log.json");
-const ADMINS_FILE = path.join(DATA_DIR, "admins.json");
-const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
-const TOTP_SECRETS_FILE = path.join(DATA_DIR, "totp_secrets.json");
-const TEMP_MAILS_FILE = path.join(DATA_DIR, "temp_mails.json");
-const EARNINGS_FILE = path.join(DATA_DIR, "earnings.json");
-const WITHDRAW_FILE = path.join(DATA_DIR, "withdrawals.json");
-const COUNTRY_PRICES_FILE = path.join(DATA_DIR, "country_prices.json");
-
 /******************** DEFAULT SETTINGS ********************/
 let settings = {
   defaultNumberCount: 10,
   cooldownSeconds: 5,
   requireVerification: true,
-  minWithdraw: 50,
-  defaultOtpPrice: 0.25,
+  minWithdraw: 50,          // minimum withdraw amount (taka)
+  defaultOtpPrice: 0.25,    // default OTP price per country (taka)
   withdrawMethods: ["bKash", "Nagad"],
   withdrawEnabled: true
 };
@@ -340,30 +316,35 @@ if (fs.existsSync(ADMINS_FILE)) {
   }
 }
 
+// TOTP Secrets storage: { userId: [ { label, secret, service } ] }
 let totpSecrets = {};
 if (fs.existsSync(TOTP_SECRETS_FILE)) {
   try { totpSecrets = JSON.parse(fs.readFileSync(TOTP_SECRETS_FILE, 'utf8')); }
   catch (e) { totpSecrets = {}; }
 }
 
+// Temp Mails storage: { userId: { address, password, token } }
 let tempMails = {};
 if (fs.existsSync(TEMP_MAILS_FILE)) {
   try { tempMails = JSON.parse(fs.readFileSync(TEMP_MAILS_FILE, 'utf8')); }
   catch (e) { tempMails = {}; }
 }
 
+// Earnings storage: { userId: { balance, totalEarned, otpCount } }
 let earnings = {};
 if (fs.existsSync(EARNINGS_FILE)) {
   try { earnings = JSON.parse(fs.readFileSync(EARNINGS_FILE, 'utf8')); }
   catch (e) { earnings = {}; }
 }
 
+// Withdrawals: [ { userId, amount, method, account, status, requestedAt, processedAt } ]
 let withdrawals = [];
 if (fs.existsSync(WITHDRAW_FILE)) {
   try { withdrawals = JSON.parse(fs.readFileSync(WITHDRAW_FILE, 'utf8')); }
   catch (e) { withdrawals = []; }
 }
 
+// Country Prices: { countryCode: priceInTaka }
 let countryPrices = {};
 if (fs.existsSync(COUNTRY_PRICES_FILE)) {
   try { countryPrices = JSON.parse(fs.readFileSync(COUNTRY_PRICES_FILE, 'utf8')); }
@@ -600,6 +581,7 @@ function maskPhoneNumber(phone) {
 function extractPhoneNumberFromMessage(text) {
   if (!text) return null;
 
+  // 1. Full number (10-15 digit)
   const fullMatch = text.match(/\+?(\d{10,15})/);
   if (fullMatch) {
     const num = fullMatch[1];
@@ -609,19 +591,24 @@ function extractPhoneNumberFromMessage(text) {
   return null;
 }
 
+// Finds matching number from OTP message in activeNumbers
 function findMatchingActiveNumber(messageText) {
   const allActive = Object.keys(activeNumbers);
   if (allActive.length === 0) return null;
 
+  // Step 1: Full number direct match
   const extracted = extractPhoneNumberFromMessage(messageText);
   if (extracted) {
     if (activeNumbers[extracted]) return extracted;
+    // try without + sign
     const noPlus = extracted.replace(/^\+/, '');
     if (activeNumbers[noPlus]) return noPlus;
   }
 
+  // Step 2: check each active number against message
+  // Check larger matches first (8 → 6 → 4 digits)
   for (const num of allActive) {
-    if (messageText.includes(num)) return num;
+    if (messageText.includes(num)) return num;           // full number
   }
   for (const num of allActive) {
     const last8 = num.slice(-8);
@@ -639,13 +626,14 @@ function findMatchingActiveNumber(messageText) {
   return null;
 }
 
+// Extract OTP/verification code from message
 function extractOTPCode(text) {
   if (!text) return null;
   const patterns = [
     /(?:otp|code|pin|verification|verify|token)[^\d]{0,10}(\d{4,8})/i,
     /(?:is|has|:)\s*(\d{4,8})\b/i,
-    /\b(\d{6})\b/,
-    /\b(\d{4})\b/,
+    /\b(\d{6})\b/,  // Most common — 6 digit OTP
+    /\b(\d{4})\b/,  // 4 digit OTP
   ];
   for (const p of patterns) {
     const m = text.match(p);
@@ -683,6 +671,8 @@ function getTimeAgo(date) {
   } catch(e) { return "unknown"; }
 }
 
+/******************** HELPER FUNCTIONS ********************/
+
 function generateRandomString(length) {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
   let result = "";
@@ -691,6 +681,8 @@ function generateRandomString(length) {
   }
   return result;
 }
+
+
 
 /******************** EMAIL SYSTEM - Mail.tm ********************/
 
@@ -747,6 +739,7 @@ function randomUsername() {
 
 async function createFreshEmail() {
   try {
+    // Step 1: Get available domain
     const domains = await mailTmRequest('GET', '/domains?page=1');
     const domainList = Array.isArray(domains) ? domains : (domains?.['hydra:member'] || []);
     console.log('Mail.tm domain list length:', domainList.length);
@@ -757,6 +750,7 @@ async function createFreshEmail() {
     }
     const domain = domainList[0].domain;
 
+    // Step 2: Create account (retry up to 3 times)
     const username = randomUsername();
     const password = randomPassword();
     const address = `${username}@${domain}`;
@@ -770,7 +764,7 @@ async function createFreshEmail() {
         console.log('Rate limited, waiting 3s...');
         await new Promise(r => setTimeout(r, 3000));
       } else {
-        break;
+        break; // non-rate-limit error, don't retry
       }
     }
 
@@ -779,6 +773,7 @@ async function createFreshEmail() {
       return null;
     }
 
+    // Step 3: Get JWT token
     const tokenRes = await mailTmRequest('POST', '/token', { address, password });
     console.log('Mail.tm token response:', JSON.stringify(tokenRes)?.substring(0, 100));
 
@@ -829,8 +824,11 @@ async function getEmailMessage(id, emailObj) {
   return '';
 }
 
+
+
 function generateTOTP(secret) {
   try {
+    // Clean secret - remove spaces
     const cleanSecret = secret.replace(/\s/g, "").toUpperCase();
     authenticator.options = { step: 30 };
     const token = authenticator.generate(cleanSecret);
@@ -914,8 +912,9 @@ bot.use(session({
     totpState: null,
     totpData: null,
     mailState: null,
-    withdrawState: null,
-    withdrawData: null
+    withdrawState: null,   // ← 'waiting_account' | 'confirm'
+    withdrawData: null,    // ← { method, account, amount }
+    waConnectState: null   // ← 'waiting_number'
   })
 }));
 
@@ -939,6 +938,7 @@ bot.use((ctx, next) => {
     }
   }
 
+  // Session fallback (should rarely be needed since defaultSession() handles this)
   if (!ctx.session) {
     ctx.session = {
       verified: false,
@@ -956,8 +956,8 @@ bot.use((ctx, next) => {
       totpData: null,
       mailState: null,
       withdrawState: null,
-      withdrawData: null
-    };
+      withdrawData: null,
+      waConnectState: null
   }
 
   if (ctx.from && !ctx.session.isAdmin) {
@@ -979,16 +979,20 @@ function clearUserState(ctx) {
 
 /******************** VERIFICATION MIDDLEWARE ********************/
 bot.use(async (ctx, next) => {
+  // শুধু private chat-এ verification চলবে
   if (ctx.chat?.type !== 'private') return next();
 
+  // Admin always passes
   if (ctx.session?.isAdmin) return next();
 
+  // /start and /adminlogin always pass
   if (ctx.message?.text?.startsWith('/start') || 
       ctx.message?.text?.startsWith('/adminlogin') ||
       ctx.message?.text?.startsWith('/cancel')) {
     return next();
   }
 
+  // Verification button always passes
   if (ctx.callbackQuery?.data === 'verify_user') return next();
 
   if (!ctx.from) return next();
@@ -997,15 +1001,17 @@ bot.use(async (ctx, next) => {
 
   const userId = ctx.from.id.toString();
   const now = Date.now();
-  const RECHECK_INTERVAL = 2 * 60 * 60 * 1000;
+  const RECHECK_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours
 
   const lastCheck = ctx.session?.lastVerificationCheck || 0;
   const checkAge = now - lastCheck;
 
+  // Within 2 hours and already verified → skip re-check
   if (ctx.session?.verified && checkAge < RECHECK_INTERVAL) {
     return next();
   }
 
+  // 2 hours passed OR not verified → do live check
   const membership = await checkUserMembership(ctx);
 
   if (membership.allJoined) {
@@ -1015,8 +1021,9 @@ bot.use(async (ctx, next) => {
     return next();
   }
 
+  // Not a member → block
   ctx.session.verified = false;
-  ctx.session.lastVerificationCheck = 0;
+  ctx.session.lastVerificationCheck = 0; // reset so next request checks again
   if (users[userId]) { users[userId].verified = false; saveUsers(); }
   console.log(`🚫 Blocked user ${userId} — not in all required groups`);
 
@@ -1090,6 +1097,7 @@ async function showMainMenu(ctx) {
 /******************** START COMMAND ********************/
 bot.start(async (ctx) => {
   try {
+    // Previously verified users should stay verified (check users.json)
     const startUserId = ctx.from.id.toString();
     ctx.session.verified = users[startUserId]?.verified || false;
     ctx.session.currentNumbers = [];
@@ -1183,11 +1191,13 @@ bot.action("verify_user", async (ctx) => {
 /******************** GET NUMBERS ********************/
 bot.hears(["📞 Get Numbers", "☎️ Get Number"], async (ctx) => {
   clearUserState(ctx);
+  // Arrange service buttons 2 per row
   const availableServices = [];
   for (const serviceId in services) {
     const service = services[serviceId];
     const availableCountries = getAvailableCountriesForService(serviceId);
     if (availableCountries.length > 0) {
+      // total number count
       let totalNums = 0;
       for (const cc of availableCountries) {
         totalNums += (numbersByCountryService[cc]?.[serviceId]?.length || 0);
@@ -1205,6 +1215,7 @@ bot.hears(["📞 Get Numbers", "☎️ Get Number"], async (ctx) => {
     );
   }
 
+  // 2 per row
   const serviceButtons = [];
   for (let i = 0; i < availableServices.length; i += 2) {
     const row = [];
@@ -1245,10 +1256,12 @@ bot.action(/^select_service:(.+)$/, async (ctx) => {
 
     const service = services[serviceId];
 
+    // Sort by price (cheapest first)
     const sortedCountries = [...availableCountries].sort((a, b) =>
       getOtpPriceForCountry(a) - getOtpPriceForCountry(b)
     );
 
+    // Build 2 per row
     const countryButtons = [];
     for (let i = 0; i < sortedCountries.length; i += 2) {
       const row = [];
@@ -1703,9 +1716,11 @@ bot.action(/^withdraw_method:(.+)$/, async (ctx) => {
   const min = settings.minWithdraw;
   const fullBal = Math.floor(bal * 100) / 100;
 
+  // waiting_amount state - user can click button OR type manually
   ctx.session.withdrawState = "waiting_amount";
   ctx.session.withdrawData = { method };
 
+  // Amount quick-select buttons
   const amountButtons = [];
   const amounts = [];
   if (bal >= min) amounts.push(min);
@@ -1724,10 +1739,16 @@ bot.action(/^withdraw_method:(.+)$/, async (ctx) => {
   amountButtons.push([{ text: "❌ Cancel", callback_data: "withdraw_cancel" }]);
 
   await ctx.editMessageText(
-    `${icon} *${method} Withdrawal*\n\n` +
-    `💰 Your balance: *${e.balance.toFixed(2)} taka*\n` +
-    `📌 Minimum: *${settings.minWithdraw} taka*\n\n` +
-    `Select from the buttons below\nor type an amount in chat (e.g.: \`75\`):`,
+    `${icon} *${method} Withdrawal*
+
+` +
+    `💰 Your balance: *${e.balance.toFixed(2)} taka*
+` +
+    `📌 Minimum: *${settings.minWithdraw} taka*
+
+` +
+    `Select from the buttons below
+or type an amount in chat (e.g.: \`75\`):`,
     {
       parse_mode: "Markdown",
       reply_markup: { inline_keyboard: amountButtons }
@@ -1768,8 +1789,15 @@ bot.action(/^withdraw_amount:([^:]+):(.+)$/, async (ctx) => {
   ctx.session.withdrawData = { method, amount };
 
   await ctx.editMessageText(
-    `${icon} *${method} - ${amount.toFixed(2)} taka*\n\n` +
-    `📱 Your *${method} number:*\nExample: \`01712345678\`\n\nType /cancel to cancel`,
+    `${icon} *${method} - ${amount.toFixed(2)} taka*
+
+` +
+    `📱 Your *${method} number:*
+` +
+    `Example: \`01712345678\`
+
+` +
+    `Type /cancel to cancel`,
     {
       parse_mode: "Markdown",
       reply_markup: {
@@ -1867,6 +1895,8 @@ bot.hears("ℹ️ Help", async (ctx) => {
     { parse_mode: "Markdown" }
   );
 });
+
+
 
 /******************** ADMIN LOGIN ********************/
 bot.command("adminlogin", async (ctx) => {
@@ -2034,6 +2064,7 @@ bot.action("admin_users", async (ctx) => {
     const totalUsers = Object.keys(users).length;
     const activeUsers = Object.keys(activeNumbers).length;
 
+    // Markdown v1 — only * _ ` [ need escaping
     const esc = (str) => String(str || '').replace(/[_*`\[]/g, '\\$&');
 
     let message = "👥 *User Statistics*\n\n";
@@ -2077,6 +2108,7 @@ bot.action("admin_users", async (ctx) => {
     });
   } catch (error) {
     console.error("Admin users error:", error.message);
+    // Ignore "message not modified" - it's not a real error
     if (error.message?.includes('message is not modified')) return;
     try {
       await ctx.editMessageText(`❌ Error: ${error.message}`, {
@@ -2227,7 +2259,7 @@ bot.action(/^admin_select_service:(.+)$/, async (ctx) => {
     "*Format (one per line):*\n" +
     "1. Just number: `8801712345678`\n" +
     "2. With country: `8801712345678|880`\n" +
-    `3. With country and service: \`8801712345678|880|${serviceId}\`\n\n` +
+    "3. With country and service: `8801712345678|880|${serviceId}`\n\n" +
     "*Note:* Country code will be auto-detected if not provided.\n" +
     "*Supported:* .txt files only",
     {
@@ -2609,24 +2641,40 @@ bot.action("admin_settings", async (ctx) => {
 
 bot.action("admin_set_count", async (ctx) => {
   if (!ctx.session.isAdmin) return await ctx.answerCbQuery("❌ Admin only");
+
   ctx.session.adminState = "waiting_set_count";
+
   await ctx.editMessageText(
-    `📞 *Set Number Count*\n\nCurrent count: *${settings.defaultNumberCount}*\n\nSend the new number count (1-100):`,
+    `📞 *Set Number Count*\n\n` +
+    `Current count: *${settings.defaultNumberCount}*\n\n` +
+    `Send the new number count (1-100):`,
     {
       parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "admin_cancel" }]] }
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "❌ Cancel", callback_data: "admin_cancel" }]
+        ]
+      }
     }
   );
 });
 
 bot.action("admin_set_cooldown", async (ctx) => {
   if (!ctx.session.isAdmin) return await ctx.answerCbQuery("❌ Admin only");
+
   ctx.session.adminState = "waiting_set_cooldown";
+
   await ctx.editMessageText(
-    `⏱ *Set Cooldown*\n\nCurrent cooldown: *${settings.cooldownSeconds} seconds*\n\nSend the new cooldown in seconds (1-3600):`,
+    `⏱ *Set Cooldown*\n\n` +
+    `Current cooldown: *${settings.cooldownSeconds} seconds*\n\n` +
+    `Send the new cooldown in seconds (1-3600):`,
     {
       parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "admin_cancel" }]] }
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "❌ Cancel", callback_data: "admin_cancel" }]
+        ]
+      }
     }
   );
 });
@@ -2636,6 +2684,7 @@ bot.action("admin_toggle_verification", async (ctx) => {
   settings.requireVerification = !settings.requireVerification;
   saveSettings();
   await ctx.answerCbQuery(`✅ Verification ${settings.requireVerification ? "Enabled" : "Disabled"}`);
+  // Reuse admin_settings display
   await ctx.editMessageText(
     "⚙️ *Bot Settings*\n\n" +
     `📞 Number Count: *${settings.defaultNumberCount}*\n` +
@@ -2649,11 +2698,23 @@ bot.action("admin_toggle_verification", async (ctx) => {
       parse_mode: "Markdown",
       reply_markup: {
         inline_keyboard: [
-          [{ text: "📞 Number Count", callback_data: "admin_set_count" }, { text: "⏱ Cooldown", callback_data: "admin_set_cooldown" }],
-          [{ text: `🔐 Verification ${settings.requireVerification ? "Disable" : "Enable"}`, callback_data: "admin_toggle_verification" }],
-          [{ text: "💵 Set OTP Price", callback_data: "admin_set_default_price" }, { text: "💸 Set Min Withdraw", callback_data: "admin_set_min_withdraw" }],
-          [{ text: `🏧 Withdraw ${settings.withdrawEnabled ? "🔴 Disable" : "🟢 Enable"}`, callback_data: "admin_toggle_withdraw" }],
-          [{ text: "🔙 Back", callback_data: "admin_back" }]
+          [
+            { text: "📞 Number Count", callback_data: "admin_set_count" },
+            { text: "⏱ Cooldown", callback_data: "admin_set_cooldown" }
+          ],
+          [
+            { text: `🔐 Verification ${settings.requireVerification ? "Disable" : "Enable"}`, callback_data: "admin_toggle_verification" }
+          ],
+          [
+            { text: "💵 Set OTP Price", callback_data: "admin_set_default_price" },
+            { text: "💸 Set Min Withdraw", callback_data: "admin_set_min_withdraw" }
+          ],
+          [
+            { text: `🏧 Withdraw ${settings.withdrawEnabled ? "🔴 Disable" : "🟢 Enable"}`, callback_data: "admin_toggle_withdraw" }
+          ],
+          [
+            { text: "🔙 Back", callback_data: "admin_back" }
+          ]
         ]
       }
     }
@@ -2667,19 +2728,46 @@ bot.action("admin_back", async (ctx) => {
   ctx.session.adminData = null;
 
   const buttons = [
-    [{ text: "📊 Stock Report", callback_data: "admin_stock" }, { text: "👥 User Stats", callback_data: "admin_users" }],
-    [{ text: "📢 Broadcast", callback_data: "admin_broadcast" }, { text: "📋 OTP Log", callback_data: "admin_otp_log" }],
-    [{ text: "➕ Add Numbers", callback_data: "admin_add_numbers" }, { text: "📤 Upload File", callback_data: "admin_upload" }],
-    [{ text: "🗑️ Delete Numbers", callback_data: "admin_delete" }, { text: "🔧 Manage Services", callback_data: "admin_manage_services" }],
-    [{ text: "🌍 Manage Countries", callback_data: "admin_manage_countries" }, { text: "⚙️ Settings", callback_data: "admin_settings" }],
-    [{ text: "💰 Country Prices", callback_data: "admin_country_prices" }, { text: "💸 Withdrawals", callback_data: "admin_withdrawals" }],
-    [{ text: "👛 Balance Management", callback_data: "admin_balance_manage" }],
-    [{ text: "🚪 Logout", callback_data: "admin_logout" }]
+    [
+      { text: "📊 Stock Report", callback_data: "admin_stock" },
+      { text: "👥 User Stats", callback_data: "admin_users" }
+    ],
+    [
+      { text: "📢 Broadcast", callback_data: "admin_broadcast" },
+      { text: "📋 OTP Log", callback_data: "admin_otp_log" }
+    ],
+    [
+      { text: "➕ Add Numbers", callback_data: "admin_add_numbers" },
+      { text: "📤 Upload File", callback_data: "admin_upload" }
+    ],
+    [
+      { text: "🗑️ Delete Numbers", callback_data: "admin_delete" },
+      { text: "🔧 Manage Services", callback_data: "admin_manage_services" }
+    ],
+    [
+      { text: "🌍 Manage Countries", callback_data: "admin_manage_countries" },
+      { text: "⚙️ Settings", callback_data: "admin_settings" }
+    ],
+    [
+      { text: "💰 Country Prices", callback_data: "admin_country_prices" },
+      { text: "💸 Withdrawals", callback_data: "admin_withdrawals" }
+    ],
+    [
+      { text: "👛 Balance Management", callback_data: "admin_balance_manage" }
+    ]
   ];
 
+  buttons.push([
+    { text: "🚪 Logout", callback_data: "admin_logout" }
+  ]);
+
   await ctx.editMessageText(
-    "🛠 *Admin Dashboard*\n\nSelect an option:",
-    { parse_mode: "Markdown", reply_markup: { inline_keyboard: buttons } }
+    "🛠 *Admin Dashboard*\n\n" +
+    "Select an option:",
+    {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: buttons }
+    }
   );
 });
 
@@ -2690,10 +2778,15 @@ bot.action("admin_cancel", async (ctx) => {
   ctx.session.adminData = null;
 
   await ctx.editMessageText(
-    "❌ *Action Cancelled*\n\nReturning to admin panel...",
+    "❌ *Action Cancelled*\n\n" +
+    "Returning to admin panel...",
     {
       parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [[{ text: "🛠 Back to Admin", callback_data: "admin_back" }]] }
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🛠 Back to Admin", callback_data: "admin_back" }]
+        ]
+      }
     }
   );
 });
@@ -2706,10 +2799,15 @@ bot.action("admin_logout", async (ctx) => {
   ctx.session.adminData = null;
 
   await ctx.editMessageText(
-    "🚪 *Admin Logged Out*\n\nYou have been logged out from admin panel.",
+    "🚪 *Admin Logged Out*\n\n" +
+    "You have been logged out from admin panel.",
     {
       parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [[{ text: "🔙 Back to Main Menu", callback_data: "back_to_services" }]] }
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔙 Back to Main Menu", callback_data: "back_to_services" }]
+        ]
+      }
     }
   );
 });
@@ -2722,6 +2820,7 @@ bot.command("cancel", async (ctx) => {
   ctx.session.totpData = null;
   ctx.session.adminState = null;
   ctx.session.adminData = null;
+  ctx.session.waConnectState = null;
   await ctx.reply("✅ Cancelled.", {
     reply_markup: {
       keyboard: [
@@ -2734,7 +2833,7 @@ bot.command("cancel", async (ctx) => {
   });
 });
 
-/******************** TEMP MAIL ********************/
+/******************** TEXT HANDLER FOR ADMIN + TOTP + WITHDRAW ********************/
 bot.hears(["📧 Temp Mail", "📧 Get Tempmail"], async (ctx) => {
   clearUserState(ctx);
   const userId = ctx.from.id.toString();
@@ -2775,6 +2874,7 @@ bot.action("tempmail_create", async (ctx) => {
 
   await ctx.answerCbQuery("⏳ Creating email...");
 
+  // Send a new message instead of editing — avoids sentMsg undefined crash
   const loadingMsg = await ctx.reply("⏳ *Creating your email...*", { parse_mode: "Markdown" });
 
   setImmediate(async () => {
@@ -2794,6 +2894,7 @@ bot.action("tempmail_create", async (ctx) => {
 
       tempMails[userId] = newEmail;
       saveTempMails();
+      console.log(`📧 Email created for user ${userId}: ${newEmail.address}`);
 
       await ctx.telegram.editMessageText(
         ctx.chat.id, loadingMsg.message_id, null,
@@ -2828,6 +2929,7 @@ bot.action("tempmail_inbox", async (ctx) => {
     await ctx.answerCbQuery("📬 Loading inbox...");
     const userId = ctx.from.id.toString();
 
+    // No email found → ask to create
     if (!tempMails[userId]) {
       return await ctx.editMessageText(
         "❌ *No email found.*\n\nPress the button below to create a new email.",
@@ -2835,11 +2937,13 @@ bot.action("tempmail_inbox", async (ctx) => {
       );
     }
 
-    const { address, provider } = tempMails[userId];
+    const { address, provider, sidToken } = tempMails[userId];
 
+    // Fetch inbox via unified provider function
     let messages = [];
     try {
       messages = await getEmailInbox(tempMails[userId]);
+      console.log(`📬 Inbox (${provider}): ${address} → ${messages.length} messages`);
     } catch(e) {
       console.error('Inbox fetch error:', e.message);
     }
@@ -2901,6 +3005,7 @@ bot.action("tempmail_inbox", async (ctx) => {
   }
 });
 
+
 bot.action("tempmail_showaddress", async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id.toString();
@@ -2951,10 +3056,13 @@ bot.action(/^totp_service:(.+)$/, async (ctx) => {
     `📌 *Where to find your key:*\n` +
     `• Facebook: Settings → Security → Two-Factor Authentication → Authenticator App → Setup Key\n` +
     `• Instagram: Settings → Security → Two-Factor → Authentication App → Manual key\n\n` +
-    `🔑 It looks like: \`JBSWY3DPEHPK3PXP\`\n\nType /cancel to cancel`,
+    `🔑 It looks like: \`JBSWY3DPEHPK3PXP\`\n\n` +
+    `Type /cancel to cancel`,
     {
       parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "totp_back" }]] }
+      reply_markup: {
+        inline_keyboard: [[{ text: "❌ Cancel", callback_data: "totp_back" }]]
+      }
     }
   );
 });
@@ -3003,6 +3111,7 @@ bot.action(/^totp_refresh:([^:]+):(.+)$/, async (ctx) => {
 
 bot.action("totp_list", async (ctx) => {
   await ctx.answerCbQuery();
+  // Back to main 2FA menu
   await ctx.editMessageText(
     "🔐 *2FA Code Generator*\n\nSelect a service:",
     {
@@ -3085,6 +3194,8 @@ bot.action("totp_back", async (ctx) => {
 });
 
 /******************** OTP GROUP MONITORING ********************/
+// ─── Real-time group leave detection ───
+// When a user leaves/is kicked from any of the required groups → immediately block them
 bot.on("chat_member", async (ctx) => {
   try {
     const member = ctx.chatMember;
@@ -3097,6 +3208,7 @@ bot.on("chat_member", async (ctx) => {
     const oldStatus = member.old_chat_member?.status;
     const newStatus = member.new_chat_member?.status;
 
+    // Check if this is one of our required groups/channels
     const isRequiredGroup = (
       chatId === MAIN_CHANNEL_ID?.toString() ||
       chatId === CHAT_GROUP_ID?.toString() ||
@@ -3105,10 +3217,12 @@ bot.on("chat_member", async (ctx) => {
 
     if (!isRequiredGroup) return;
 
+    // User was a member and now left/kicked/banned
     const wasActive = ["member", "administrator", "creator"].includes(oldStatus);
     const nowGone = ["left", "kicked", "restricted"].includes(newStatus);
 
     if (wasActive && nowGone) {
+      // Immediately revoke their verification
       if (users[userId]) {
         users[userId].verified = false;
         saveUsers();
@@ -3116,6 +3230,7 @@ bot.on("chat_member", async (ctx) => {
       console.log(`🚫 User ${userId} left/kicked from ${chatId} — access revoked immediately`);
     }
 
+    // User rejoined → reset so next request does a fresh check
     const wasGone = ["left", "kicked"].includes(oldStatus);
     const nowActive = ["member", "administrator", "creator"].includes(newStatus);
 
@@ -3130,11 +3245,13 @@ bot.on("chat_member", async (ctx) => {
 
 bot.on("message", async (ctx, next) => {
   try {
+    // Only process messages from OTP group
     const chatId = ctx.chat.id;
     const isOtpGroup =
       chatId === OTP_GROUP_ID ||
       chatId === Number(OTP_GROUP_ID) ||
       chatId.toString() === OTP_GROUP_ID.toString();
+    // IMPORTANT: call next() so bot.on("text") still fires for private chats
     if (!isOtpGroup) return next();
 
     const messageText = ctx.message.text || ctx.message.caption || '';
@@ -3143,6 +3260,7 @@ bot.on("message", async (ctx, next) => {
 
     console.log(`📨 OTP Group [${messageId}]: ${messageText.substring(0, 80)}`);
 
+    // 1. Which active number is this message for?
     const matchedNumber = findMatchingActiveNumber(messageText);
     if (!matchedNumber) {
       console.log('⚠️ No matching active number found');
@@ -3155,6 +3273,7 @@ bot.on("message", async (ctx, next) => {
     const userId   = userData.userId;
     const countryCode = userData.countryCode || '';
 
+    // Guard against duplicate message IDs (prevents double earning)
     if (userData.lastOTP === messageId) {
       console.log(`⚠️ Duplicate message ${messageId} ignored`);
       return;
@@ -3163,8 +3282,10 @@ bot.on("message", async (ctx, next) => {
     userData.otpCount = (userData.otpCount || 0) + 1;
     saveActiveNumbers();
 
+    // 2. Extract OTP code (if any)
     const otpCode = extractOTPCode(messageText);
 
+    // 3. Add earning and send notification to user
     const earned      = addEarning(userId, countryCode);
     const userBalance = getUserEarnings(userId).balance;
     const service     = services[userData.service] || { icon: '📱', name: userData.service };
@@ -3184,9 +3305,13 @@ bot.on("message", async (ctx, next) => {
       `\n💵 *+${earned.toFixed(2)} taka earned!*\n` +
       `💰 *Current Balance: ${userBalance.toFixed(2)} taka*`;
 
+    // Send notification to user
     await ctx.telegram.sendMessage(userId, notifyText, { parse_mode: 'Markdown' });
+
+    // 4. Forward original OTP group message for full context
     await ctx.telegram.forwardMessage(userId, OTP_GROUP_ID, messageId);
 
+    // 5. Save log
     otpLog.push({
       phoneNumber: matchedNumber,
       userId,
@@ -3223,6 +3348,7 @@ bot.action("withdraw_confirm", async (ctx) => {
     return await ctx.editMessageText("❌ Balance has changed. Please try again.", { parse_mode: "Markdown" });
   }
 
+  // Deduct balance
   userEarnings.balance = parseFloat((userEarnings.balance - amount).toFixed(2));
   saveEarnings();
 
@@ -3253,6 +3379,7 @@ bot.action("withdraw_confirm", async (ctx) => {
     { parse_mode: "Markdown" }
   );
 
+  // Notify all admins
   for (const adminId of admins) {
     try {
       await ctx.telegram.sendMessage(
@@ -3318,7 +3445,8 @@ bot.action(/^wadmin_approve:(.+)$/, async (ctx) => {
   saveWithdrawals();
 
   await ctx.editMessageText(
-    `✅ *Withdraw Approved!*\n\n👤 ${w.userName}\n💵 ${w.amount.toFixed(2)} taka → ${w.method}\n📱 ${w.account}`,
+    `✅ *Withdraw Approved!*\n\n` +
+    `👤 ${w.userName}\n💵 ${w.amount.toFixed(2)} taka → ${w.method}\n📱 ${w.account}`,
     { parse_mode: "Markdown" }
   );
 
@@ -3348,12 +3476,14 @@ bot.action(/^wadmin_reject:(.+)$/, async (ctx) => {
   w.processedAt = new Date().toISOString();
   saveWithdrawals();
 
+  // Refund balance
   const userEarnings = getUserEarnings(w.userId);
   userEarnings.balance = parseFloat((userEarnings.balance + w.amount).toFixed(2));
   saveEarnings();
 
   await ctx.editMessageText(
-    `❌ *Withdraw Rejected & Refunded!*\n\n👤 ${w.userName}\n💵 ${w.amount.toFixed(2)} taka refunded.`,
+    `❌ *Withdraw Rejected & Refunded!*\n\n` +
+    `👤 ${w.userName}\n💵 ${w.amount.toFixed(2)} taka refunded.`,
     { parse_mode: "Markdown" }
   );
 
@@ -3410,7 +3540,9 @@ bot.action("admin_set_country_price", async (ctx) => {
     "You can set multiple countries in one message (one per line):",
     {
       parse_mode: "Markdown",
-      reply_markup: { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "admin_cancel" }]] }
+      reply_markup: {
+        inline_keyboard: [[{ text: "❌ Cancel", callback_data: "admin_cancel" }]]
+      }
     }
   );
 });
@@ -3431,6 +3563,7 @@ bot.action("admin_balance_manage", async (ctx) => {
   if (!ctx.session.isAdmin) return await ctx.answerCbQuery("❌ Admin only");
   await ctx.answerCbQuery();
 
+  // Top earners
   const topUsers = Object.entries(earnings)
     .sort(([,a],[,b]) => b.totalEarned - a.totalEarned)
     .slice(0, 10);
@@ -3469,7 +3602,10 @@ bot.action("admin_add_balance", async (ctx) => {
   await ctx.answerCbQuery();
   ctx.session.adminState = "waiting_add_balance";
   await ctx.editMessageText(
-    "➕ *Add User Balance*\n\nFormat: `[user_id] [amount]`\n\nExample: `123456789 50`",
+    "➕ *Add User Balance*\n\n" +
+    "Format: `[user_id] [amount]`\n\n" +
+    "Example: `123456789 50`\n\n" +
+    "Find User ID via /admin → User Stats:",
     { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "admin_cancel" }]] } }
   );
 });
@@ -3479,7 +3615,9 @@ bot.action("admin_deduct_balance", async (ctx) => {
   await ctx.answerCbQuery();
   ctx.session.adminState = "waiting_deduct_balance";
   await ctx.editMessageText(
-    "➖ *Deduct User Balance*\n\nFormat: `[user_id] [amount]`\n\nExample: `123456789 25`",
+    "➖ *Deduct User Balance*\n\n" +
+    "Format: `[user_id] [amount]`\n\n" +
+    "Example: `123456789 25`",
     { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "admin_cancel" }]] } }
   );
 });
@@ -3489,11 +3627,12 @@ bot.action("admin_reset_balance", async (ctx) => {
   await ctx.answerCbQuery();
   ctx.session.adminState = "waiting_reset_balance";
   await ctx.editMessageText(
-    "🔄 *Reset User Balance*\n\nSend the User ID (balance will be set to 0):\n\nExample: `123456789`",
+    "🔄 *Reset User Balance*\n\n" +
+    "Send the User ID (balance will be set to 0):\n\n" +
+    "Example: `123456789`",
     { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "admin_cancel" }]] } }
   );
 });
-
 bot.action("admin_withdrawals", async (ctx) => {
   if (!ctx.session.isAdmin) return await ctx.answerCbQuery("❌ Admin only");
   await ctx.answerCbQuery();
@@ -3632,21 +3771,78 @@ bot.action("admin_toggle_withdraw", async (ctx) => {
       parse_mode: "Markdown",
       reply_markup: {
         inline_keyboard: [
-          [{ text: "📞 Number Count", callback_data: "admin_set_count" }, { text: "⏱ Cooldown", callback_data: "admin_set_cooldown" }],
-          [{ text: `🔐 Verification ${settings.requireVerification ? "Disable" : "Enable"}`, callback_data: "admin_toggle_verification" }],
-          [{ text: "💵 Set OTP Price", callback_data: "admin_set_default_price" }, { text: "💸 Set Min Withdraw", callback_data: "admin_set_min_withdraw" }],
-          [{ text: `🏧 Withdraw ${settings.withdrawEnabled ? "🔴 Disable" : "🟢 Enable"}`, callback_data: "admin_toggle_withdraw" }],
-          [{ text: "🔙 Back", callback_data: "admin_back" }]
+          [
+            { text: "📞 Number Count", callback_data: "admin_set_count" },
+            { text: "⏱ Cooldown", callback_data: "admin_set_cooldown" }
+          ],
+          [
+            { text: `🔐 Verification ${settings.requireVerification ? "Disable" : "Enable"}`, callback_data: "admin_toggle_verification" }
+          ],
+          [
+            { text: "💵 Set OTP Price", callback_data: "admin_set_default_price" },
+            { text: "💸 Set Min Withdraw", callback_data: "admin_set_min_withdraw" }
+          ],
+          [
+            { text: `🏧 Withdraw ${settings.withdrawEnabled ? "🔴 Disable" : "🟢 Enable"}`, callback_data: "admin_toggle_withdraw" }
+          ],
+          [
+            { text: "🔙 Back", callback_data: "admin_back" }
+          ]
         ]
       }
     }
   );
 });
 
+/******************** WHATSAPP CONNECT HANDLERS ********************/
+bot.action("wa_connect", async (ctx) => {
+  await ctx.answerCbQuery();
+  ctx.session.waConnectState = "waiting_number";
+  await ctx.reply(
+    "📱 *WhatsApp Connect*\n\n" +
+    "তোমার WhatsApp নম্বর দাও *(country code সহ)*:\n" +
+    "Example: `8801712345678`\n\n" +
+    "⚠️ এই নম্বরের WA দিয়ে number check হবে।",
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.action("wa_status", async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id.toString();
+  const connected = isWAConnected(userId);
+  await ctx.reply(
+    connected
+      ? "✅ *WhatsApp connected!*\n\nNumber assign হলে WA status দেখাবে।"
+      : "🔴 *WhatsApp connected নেই।*\n\nConnect করলে number check হবে।",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: connected
+          ? [[{ text: "🔴 Disconnect WA", callback_data: "wa_disconnect" }]]
+          : [[{ text: "📱 Connect WhatsApp", callback_data: "wa_connect" }]]
+      }
+    }
+  );
+});
+
+bot.action("wa_disconnect", async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id.toString();
+  if (waSessions[userId]?.sock) {
+    try { waSessions[userId].sock.end(); } catch(e) {}
+    delete waSessions[userId];
+  }
+  const sessionDir = path.join(WA_SESSIONS_DIR, userId.toString());
+  try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
+  await ctx.reply("🔴 *WhatsApp disconnected.*", { parse_mode: "Markdown" });
+});
+
 /******************** ERROR HANDLER ********************/
 bot.catch((err, ctx) => {
   console.error(`❌ Bot error for ${ctx.updateType}:`, err);
 });
+
 
 /******************** ADMIN FILE UPLOAD HANDLER ********************/
 bot.on("document", async (ctx) => {
@@ -3666,9 +3862,11 @@ bot.on("document", async (ctx) => {
 
     await ctx.reply("⏳ *Processing file...*", { parse_mode: "Markdown" });
 
+    // Download the file
     const fileLink = await ctx.telegram.getFileLink(doc.file_id);
     const fileUrl = fileLink.href || fileLink.toString();
 
+    // Fetch file content (Telegram files always use HTTPS)
     const fileContent = await new Promise((resolve, reject) => {
       https.get(fileUrl, (res) => {
         let data = "";
@@ -3733,50 +3931,6 @@ bot.on("document", async (ctx) => {
   }
 });
 
-/******************** WHATSAPP CONNECT ACTIONS ********************/
-bot.action("wa_connect", async (ctx) => {
-  await ctx.answerCbQuery();
-  ctx.session.waConnectState = "waiting_number";
-  await ctx.reply(
-    "📱 *WhatsApp Connect*\n\n" +
-    "তোমার WhatsApp নম্বর দাও *(country code সহ)*:\n" +
-    "Example: `8801712345678`\n\n" +
-    "⚠️ এই নম্বরের WA দিয়ে number check হবে।",
-    { parse_mode: "Markdown" }
-  );
-});
-
-bot.action("wa_status", async (ctx) => {
-  await ctx.answerCbQuery();
-  const userId = ctx.from.id.toString();
-  const connected = isWAConnected(userId);
-  await ctx.reply(
-    connected
-      ? "✅ *WhatsApp connected!*\n\nNumber assign হলে WA ✅/❌ status দেখাবে।"
-      : "🔴 *WhatsApp connected নেই।*\n\nConnect করলে number check হবে।",
-    {
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: connected
-          ? [[{ text: "🔴 Disconnect WA", callback_data: "wa_disconnect" }]]
-          : [[{ text: "📱 Connect WhatsApp", callback_data: "wa_connect" }]]
-      }
-    }
-  );
-});
-
-bot.action("wa_disconnect", async (ctx) => {
-  await ctx.answerCbQuery();
-  const userId = ctx.from.id.toString();
-  if (waSessions[userId]?.sock) {
-    try { waSessions[userId].sock.end(); } catch(e) {}
-    delete waSessions[userId];
-  }
-  const sessionDir = path.join(DATA_DIR, "wa_sessions", userId.toString());
-  try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
-  await ctx.reply("🔴 *WhatsApp disconnected.*", { parse_mode: "Markdown" });
-});
-
 /******************** TEXT INPUT HANDLER ********************/
 bot.on("text", async (ctx, next) => {
   try {
@@ -3791,13 +3945,13 @@ bot.on("text", async (ctx, next) => {
       if (phone.length < 10 || phone.length > 15) {
         return await ctx.reply("❌ Invalid number. Country code সহ দাও।\nExample: `8801712345678`", { parse_mode: "Markdown" });
       }
-      const loadMsg = await ctx.reply("⏳ *Connecting...*", { parse_mode: "Markdown" });
+      const loadMsg = await ctx.reply("⏳ *Connecting to WhatsApp...*", { parse_mode: "Markdown" });
       try {
         const rawCode = await createWASession(userId, phone);
         const code = rawCode.match(/.{1,4}/g)?.join("-") || rawCode;
         await ctx.telegram.deleteMessage(ctx.chat.id, loadMsg.message_id).catch(() => {});
         await ctx.reply(
-          `🔑 *Pairing Code*\n\n` +
+          `🔑 *WhatsApp Pairing Code*\n\n` +
           `\`${code}\`\n\n` +
           `📋 *Steps:*\n` +
           `1. WhatsApp খোলো\n` +
@@ -3822,8 +3976,6 @@ bot.on("text", async (ctx, next) => {
       }
       return;
     }
-
-    const KEYBOARD_BUTTONS = [
       "☎️ Get Number", "📞 Get Numbers",
       "📧 Get Tempmail", "📧 Temp Mail",
       "🔐 2FA", "🔐 2FA Codes",
@@ -4163,6 +4315,7 @@ async function startBot() {
     console.log("🛠 Admin Login: /adminlogin [PASSWORD]");
     console.log("=====================================");
 
+    // ── 2-hour scheduled membership check for ALL users ──
     setInterval(async () => {
       if (!settings.requireVerification) return;
 
@@ -4200,6 +4353,7 @@ async function startBot() {
             blocked++;
             console.log(`🚫 [Scheduled] User ${userId} blocked — left a group`);
 
+            // Notify the user
             try {
               await bot.telegram.sendMessage(userId,
                 "⛔ *Access Blocked!*\n\nYou have left one or more required groups.\n\nJoin all groups and press VERIFY to continue.",
@@ -4208,18 +4362,19 @@ async function startBot() {
                   reply_markup: {
                     inline_keyboard: [
                       [{ text: "1️⃣ 📢 Main Channel", url: MAIN_CHANNEL }],
-                      [{ text: "2️⃣ 💬 Chat Group", url: CHAT_GROUP }],
+                      [{ text: "2️⃣ 💬 Chat Group", url: NUMBER_CHANNEL }],
                       [{ text: "3️⃣ 📨 OTP Group", url: OTP_GROUP }],
                       [{ text: "✅ VERIFY", callback_data: "verify_user" }]
                     ]
                   }
                 }
               );
-            } catch(e) {}
+            } catch(e) {} // user may have blocked the bot
           } else {
             users[userId].verified = true;
           }
 
+          // Small delay between each user to avoid Telegram rate limit
           await new Promise(r => setTimeout(r, 100));
 
         } catch(e) {
@@ -4230,7 +4385,7 @@ async function startBot() {
       saveUsers();
       console.log(`✅ [Scheduled Check] Done. ${blocked} user(s) blocked.`);
 
-    }, 2 * 60 * 60 * 1000);
+    }, 2 * 60 * 60 * 1000); // every 2 hours
 
   } catch (error) {
     console.error("❌ Failed to start bot:", error);
@@ -4242,4 +4397,4 @@ async function startBot() {
 startBot();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'))
