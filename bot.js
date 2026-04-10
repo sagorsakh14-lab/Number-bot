@@ -36,12 +36,13 @@ async function createWASession(userId, phoneNumber) {
   if (!fs.existsSync(WA_SESSIONS_DIR)) fs.mkdirSync(WA_SESSIONS_DIR, { recursive: true });
   const sessionDir = path.join(WA_SESSIONS_DIR, userId.toString());
 
+  // পুরনো session সবসময় delete করো
   try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
   fs.mkdirSync(sessionDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
   const { version } = await fetchLatestBaileysVersion();
-  console.log(`🔧 WA version: ${version}`);
+  console.log(`🔧 WA Socket version: ${version}`);
 
   const sock = makeWASocket({
     version,
@@ -60,8 +61,7 @@ async function createWASession(userId, phoneNumber) {
   waSessions[userId] = { sock, isConnected: false };
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    console.log(`🔔 WA connection: ${connection || "—"} | qr: ${qr ? "yes" : "no"}`);
+  sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
     if (connection === "open") {
       waSessions[userId].isConnected = true;
       console.log(`✅ WA connected: user ${userId}`);
@@ -72,35 +72,26 @@ async function createWASession(userId, phoneNumber) {
       if (sc === DisconnectReason.loggedOut || sc === 401) {
         try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch(e) {}
         delete waSessions[userId];
-      } else if (waSessions[userId]) {
-        // auto reconnect
-        setTimeout(() => restoreWASessions(), 3000);
+        console.log(`🗑️ WA session deleted: user ${userId}`);
       }
     }
   });
 
   const cleanPhone = phoneNumber.replace(/\D/g, "");
   console.log(`📱 Phone: ${cleanPhone}`);
+  console.log(`🔑 creds.registered = ${sock.authState.creds.registered}`);
 
-  // QR event এর জন্য অপেক্ষা করো — এটাই সঠিক trigger
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timeout — WA server respond করেনি")), 60000);
+  // 2 সেকেন্ড wait করো socket initialize হওয়ার জন্য
+  await new Promise(r => setTimeout(r, 2000));
 
-    sock.ev.on("connection.update", async ({ qr }) => {
-      if (qr) {
-        console.log(`📲 QR ready — requesting pairing code...`);
-        clearTimeout(timeout);
-        try {
-          const code = await sock.requestPairingCode(cleanPhone);
-          console.log(`✅ Pairing code: ${code}`);
-          resolve(code);
-        } catch(e) {
-          console.error(`❌ Pairing code error: ${e.message}`);
-          reject(e);
-        }
-      }
-    });
-  });
+  if (!sock.authState.creds.registered) {
+    console.log(`🔑 requestPairingCode() call হচ্ছে...`);
+    const code = await sock.requestPairingCode(cleanPhone);
+    console.log(`✅ Pairing code: ${code}`);
+    return code;
+  } else {
+    throw new Error("Already registered — session delete করে আবার try করো");
+  }
 }
 
 function isWAConnected(userId) {
