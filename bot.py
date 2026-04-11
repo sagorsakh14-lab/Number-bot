@@ -1132,6 +1132,13 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
             icon = ""
         nums_text_lines.append(f"{i+1}. `+{n}`{icon}")
     nums_text = "\n".join(nums_text_lines)
+
+    msg = (
+        f"{svc['icon']} *{svc['name']}* — {country['flag']} *{country['name']}*\n"
+        f"💰 *Earnings per OTP:* {price:.2f} taka\n\n"
+        f"📞 *Your Numbers:*\n{nums_text}"
+    )
+
     buttons = [
         [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
@@ -1182,6 +1189,13 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             icon = ""
         nums_text_lines.append(f"{i+1}. `+{n}`{icon}")
     nums_text = "\n".join(nums_text_lines)
+
+    msg = (
+        f"{svc['icon']} *{svc['name']}* — {country['flag']} *{country['name']}*\n"
+        f"💰 *Earnings per OTP:* {price:.2f} taka\n\n"
+        f"📞 *Your Numbers:*\n{nums_text}"
+    )
+
     buttons = [
         [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
