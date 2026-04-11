@@ -300,11 +300,11 @@ def generate_totp(secret: str):
 
 # ─── WhatsApp Pairing via Playwright ───
 async def get_wa_pairing_code(phone: str, user_id: str) -> str:
-    """Launch WhatsApp Web, get pairing code, keep session alive"""
     uid = str(user_id)
     digits = re.sub(r"\D", "", phone)
     logger.info(f"📱 WA pairing for: +{digits}")
 
+    # পুরনো session বন্ধ করো
     old = wa_sessions.get(uid, {})
     if old.get("browser"):
         try: await old["browser"].close()
@@ -314,12 +314,11 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
         except: pass
     wa_sessions[uid] = {"browser": None, "page": None, "connected": False, "pw": None}
 
-    import shutil
     chromium_path = (
         os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or
         shutil.which("chromium") or
         shutil.which("chromium-browser") or
-        "/usr/bin/chromium" if os.path.exists("/usr/bin/chromium") else None
+        ("/usr/bin/chromium" if os.path.exists("/usr/bin/chromium") else None)
     )
 
     pw_instance = await async_playwright().start()
@@ -329,16 +328,15 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
             "--no-sandbox", "--disable-setuid-sandbox",
             "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote",
-            "--window-size=1280,800",
+            "--window-size=1280,900",
         ]
     )
     if chromium_path:
         launch_opts["executable_path"] = chromium_path
-        logger.info(f"🔍 Chromium: {chromium_path}")
 
     browser = await pw_instance.chromium.launch(**launch_opts)
     page = await browser.new_page(
-        viewport={"width": 1280, "height": 800},
+        viewport={"width": 1280, "height": 900},
         user_agent=(
             "Mozilla/5.0 (X11; Linux x86_64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -352,149 +350,109 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
     try:
         logger.info("🌐 Loading WhatsApp Web...")
         await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(4)
+        await asyncio.sleep(5)
 
-        # "Link with phone number" button
-        phone_btn = None
-        for sel in [
-            "button[data-testid='link-device-phone-num-button']",
-            "button:has-text('Link with phone number')",
-            "div[role='button']:has-text('Link with phone number')",
-            "span:has-text('Link with phone number')",
-        ]:
+        # Step 1: "Link with phone number" button — JS দিয়ে click
+        clicked = await page.evaluate("""() => {
+            const all = Array.from(document.querySelectorAll('button, div[role="button"], span'));
+            const btn = all.find(el => el.innerText && el.innerText.toLowerCase().includes('phone number'));
+            if (btn) { btn.click(); return true; }
+            return false;
+        }""")
+        if not clicked:
+            # data-testid দিয়ে try
             try:
-                el = page.locator(sel).first
-                await el.wait_for(state="attached", timeout=30000)
-                # scroll into view and force click — viewport এর বাইরে থাকলেও কাজ করবে
-                await el.scroll_into_view_if_needed()
-                await asyncio.sleep(0.5)
-                await el.click(force=True)
-                phone_btn = el
-                logger.info(f"✅ Button clicked: {sel}")
-                break
-            except: continue
-
-        if not phone_btn:
-            # JavaScript দিয়ে শেষ চেষ্টা
-            try:
-                await page.evaluate("""
-                    const btns = Array.from(document.querySelectorAll('button, div[role=button]'));
-                    const btn = btns.find(b => b.innerText && b.innerText.includes('phone number'));
-                    if (btn) btn.click();
-                """)
-                logger.info("✅ Button clicked via JS")
-                await asyncio.sleep(1)
-            except:
-                raise Exception("'Link with phone number' button পাওয়া যায়নি")
-
+                el = page.locator("[data-testid='link-device-phone-num-button']").first
+                await el.wait_for(state="attached", timeout=15000)
+                await page.evaluate("el => el.click()", await el.element_handle())
+                clicked = True
+            except: pass
+        logger.info(f"✅ Phone btn click: {clicked}")
         await asyncio.sleep(3)
 
-        # Phone input — multiple selectors try করো
-        input_el = None
-        for sel in [
-            "input[data-testid='phone-number-input']",
-            "input[type='tel']",
-            "input[placeholder*='phone']",
-            "input[placeholder*='number']",
-            "input[placeholder*='Phone']",
-            "input",
-        ]:
-            try:
-                el = page.locator(sel).first
-                await el.wait_for(state="visible", timeout=8000)
-                await el.scroll_into_view_if_needed()
-                input_el = el
-                logger.info(f"✅ Input found: {sel}")
+        # Step 2: Phone number input — JS দিয়ে fill
+        filled = await page.evaluate(f"""() => {{
+            // সব input খোঁজো
+            const inputs = Array.from(document.querySelectorAll('input'));
+            for (const inp of inputs) {{
+                inp.focus();
+                // React input value setter
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                nativeInputValueSetter.call(inp, '{digits}');
+                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                return true;
+            }}
+            return false;
+        }}""")
+        logger.info(f"✅ Input filled: {filled}")
+        await asyncio.sleep(2)
+
+        # Step 3: Next button — JS দিয়ে click
+        await page.evaluate("""() => {
+            const all = Array.from(document.querySelectorAll('button, div[role="button"]'));
+            const btn = all.find(el => el.innerText && 
+                (el.innerText.toLowerCase().includes('next') || 
+                 el.innerText.toLowerCase().includes('এগিয়ে')));
+            if (btn) btn.click();
+            // অথবা Enter press
+            const inp = document.querySelector('input');
+            if (inp) inp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+        }""")
+        logger.info("✅ Next clicked")
+        await asyncio.sleep(4)
+
+        # Step 4: Pairing code extract — multiple methods
+        code = None
+
+        # Method 1: page body থেকে code pattern খোঁজো
+        for attempt in range(10):
+            body_text = await page.evaluate("() => document.body.innerText")
+            logger.info(f"🔍 Body scan attempt {attempt+1}")
+
+            # XXXX-XXXX pattern
+            m = re.search(r'([A-Z0-9]{4})[\s\-]([A-Z0-9]{4})', body_text)
+            if m:
+                code = f"{m.group(1)}-{m.group(2)}"
+                logger.info(f"🎉 Code found (pattern1): {code}")
                 break
-            except: continue
 
-        if not input_el:
-            # JS দিয়ে শেষ চেষ্টা
-            try:
-                await page.evaluate(f"""
-                    const inputs = document.querySelectorAll('input');
-                    for (const inp of inputs) {{
-                        inp.focus();
-                        inp.value = '{digits}';
-                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        break;
-                    }}
-                """)
-                logger.info("✅ Input filled via JS")
-                await asyncio.sleep(1)
-                # Next button JS click
-                await page.evaluate("""
-                    const btns = Array.from(document.querySelectorAll('button, div[role=button]'));
-                    const btn = btns.find(b => b.innerText && (b.innerText.includes('Next') || b.innerText.includes('next')));
-                    if (btn) btn.click();
-                """)
-                await asyncio.sleep(3)
-            except Exception as je:
-                raise Exception(f"Phone input পাওয়া যায়নি: {je}")
-        else:
-            await input_el.click()
-            await input_el.fill("")
-            await asyncio.sleep(0.3)
-            await input_el.type(digits, delay=80)
-            await asyncio.sleep(1)
+            # 8 char alphanumeric
+            m = re.search(r'\b([A-Z0-9]{8})\b', body_text)
+            if m:
+                raw = m.group(1)
+                code = f"{raw[:4]}-{raw[4:]}"
+                logger.info(f"🎉 Code found (pattern2): {code}")
+                break
 
-            # Next button
-            clicked = False
+            await asyncio.sleep(2)
+
+        # Method 2: specific selectors
+        if not code:
             for sel in [
-                "button[data-testid='link-device-phone-num-next-btn']",
-                "button:has-text('Next')",
-                "div[role='button']:has-text('Next')",
-                "button[type='submit']",
+                "[data-testid='device-link-passkey']",
+                "[data-testid='pairing-code']",
+                "div[data-testid*='passkey']",
+                "div[data-testid*='pairing']",
+                "span[data-testid*='passkey']",
+                "div[class*='passkey']",
+                "div[class*='pairing']",
             ]:
                 try:
                     el = page.locator(sel).first
-                    await el.scroll_into_view_if_needed()
-                    await el.click(force=True)
-                    logger.info(f"✅ Next clicked: {sel}")
-                    clicked = True
-                    break
+                    await el.wait_for(state="visible", timeout=3000)
+                    raw = (await el.inner_text()).strip()
+                    clean = re.sub(r"[^A-Z0-9]", "", raw.upper())
+                    if len(clean) >= 8:
+                        code = f"{clean[:4]}-{clean[4:8]}"
+                        logger.info(f"🎉 Code from selector {sel}: {code}")
+                        break
                 except: continue
-            if not clicked:
-                await input_el.press("Enter")
 
-        await asyncio.sleep(3)
+        if not code:
+            raise Exception("Pairing code পাওয়া যায়নি — WhatsApp Web layout পরিবর্তন হয়েছে")
 
-        # Pairing code
-        code_el = None
-        for sel in [
-            "[data-testid='device-link-passkey']",
-            "[data-testid='pairing-code']",
-            "div[data-testid*='passkey']",
-            "div[data-testid*='pairing']",
-            "span[data-testid*='passkey']",
-        ]:
-            try:
-                el = page.locator(sel).first
-                await el.wait_for(state="visible", timeout=25000)
-                code_el = el
-                logger.info(f"✅ Code el: {sel}")
-                break
-            except: continue
-
-        if not code_el:
-            await asyncio.sleep(3)
-            body = await page.inner_text("body")
-            m = re.search(r'\b([A-Z0-9]{4}[-\s]?[A-Z0-9]{4})\b', body)
-            if m:
-                raw = re.sub(r"[^A-Z0-9]", "", m.group(1))
-                result = raw[:4] + "-" + raw[4:8]
-                logger.info(f"🎉 Code from body: {result}")
-                return result
-            raise Exception("Pairing code দেখা গেল না")
-
-        raw = (await code_el.inner_text()).strip()
-        code = re.sub(r"[^A-Z0-9]", "", raw.upper())
-        if len(code) < 8:
-            raise Exception(f"Invalid code: '{raw}'")
-
-        result = code[:4] + "-" + code[4:8]
-        logger.info(f"🎉 Pairing code: {result}")
-        return result
+        return code
 
     except Exception as e:
         try: await browser.close()
