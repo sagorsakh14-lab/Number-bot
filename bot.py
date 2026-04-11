@@ -1158,7 +1158,7 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wa_connected = uid in wa_sessions and wa_sessions[uid].get("connected")
     msg = await build_numbers_message(svc_id, cc, nums)
     if wa_connected:
-        msg += "\n\n_\u23f3 WhatsApp checking..._"
+        msg += "\n\n_⏳ WhatsApp checking..._"
     s_buttons = [
         [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
@@ -1166,9 +1166,11 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     if not wa_connected:
         s_buttons.append([InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")])
-    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(s_buttons))
+    sent = await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(s_buttons))
 
     if wa_connected:
+        chat_id   = query.message.chat_id
+        message_id = query.message.message_id
         _svc_id, _cc, _nums, _uid = svc_id, cc, nums[:], uid
         async def wa_check_task_sc():
             try:
@@ -1186,9 +1188,13 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
                 ]
                 try:
-                    await query.edit_message_text(updated_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(final_btns))
-                except:
-                    pass
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id,
+                        text=updated_msg, parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(final_btns)
+                    )
+                except Exception as e:
+                    logger.warning(f"WA edit error (sc): {e}")
             except Exception as e:
                 logger.warning(f"WA check task error (sc): {e}")
         asyncio.create_task(wa_check_task_sc())
@@ -1223,7 +1229,7 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wa_connected = uid in wa_sessions and wa_sessions[uid].get("connected")
     msg = await build_numbers_message(svc_id, cc, nums)
     if wa_connected:
-        msg += "\n\n_\u23f3 WhatsApp checking..._"
+        msg += "\n\n_⏳ WhatsApp checking..._"
     n_buttons = [
         [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
@@ -1234,6 +1240,8 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(n_buttons))
 
     if wa_connected:
+        chat_id2   = query.message.chat_id
+        message_id2 = query.message.message_id
         _svc_id2, _cc2, _nums2, _uid2 = svc_id, cc, nums[:], uid
         async def wa_check_task_nn():
             try:
@@ -1251,9 +1259,13 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
                 ]
                 try:
-                    await query.edit_message_text(updated_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(final_btns))
-                except:
-                    pass
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id2, message_id=message_id2,
+                        text=updated_msg, parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(final_btns)
+                    )
+                except Exception as e:
+                    logger.warning(f"WA edit error (nn): {e}")
             except Exception as e:
                 logger.warning(f"WA check task error (nn): {e}")
         asyncio.create_task(wa_check_task_nn())
