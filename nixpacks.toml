@@ -1,3 +1,6 @@
+[variables]
+NIXPACKS_NO_MISE = "1"
+
 [phases.setup]
 nixPkgs = [
   "python311",
