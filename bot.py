@@ -350,7 +350,7 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
     try:
         logger.info("🌐 Loading WhatsApp Web...")
         await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(6)
+        await asyncio.sleep(4)
 
         # Step 1: "Link with phone number" button click — multiple methods
         clicked = False
@@ -393,7 +393,7 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
             except:
                 pass
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
 
         # Step 2: Country code + phone number input
         country_prefix = ""
@@ -457,95 +457,64 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
 
         await asyncio.sleep(2)
 
-        # Step 3: Next button — React state check করে click
+        # Step 3: Next button — fast approach
         next_clicked = None
 
-        # Method 1: data-testid দিয়ে enabled হওয়ার wait করো (8 attempt)
-        for attempt in range(8):
+        # Method 1: testid enabled হলে click (max 3 attempts, 1s each)
+        for attempt in range(3):
             try:
                 next_btn = page.locator("[data-testid='link-device-phone-num-next-btn']").first
-                await next_btn.wait_for(state="visible", timeout=3000)
+                await next_btn.wait_for(state="visible", timeout=2000)
                 is_disabled = await next_btn.is_disabled()
-                aria_disabled = await next_btn.get_attribute("aria-disabled")
-                logger.info(f"🔘 Next disabled={is_disabled} aria={aria_disabled} attempt={attempt+1}")
-                if not is_disabled and aria_disabled != "true":
+                logger.info(f"🔘 Next disabled={is_disabled} attempt={attempt+1}")
+                if not is_disabled:
                     await next_btn.click()
-                    next_clicked = "testid-enabled"
-                    logger.info("✅ Next clicked (enabled)")
+                    next_clicked = "testid"
+                    logger.info("✅ Next clicked (testid)")
                     break
-                # Button এখনো disabled — React state আবার trigger করো
-                await page.evaluate("""() => {
-                    const visibleInputs = Array.from(document.querySelectorAll('input')).filter(el => el.offsetParent !== null);
-                    visibleInputs.forEach(el => {
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
-                        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-                    });
-                }""")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
             except:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(0.5)
 
-        # Method 2: Enter key (React form submit trigger)
+        # Method 2: Enter key — সবচেয়ে fast
         if not next_clicked:
-            # Last focused input এ Enter চাপো
             await page.keyboard.press("Enter")
             next_clicked = "enter"
             logger.info("✅ Next via Enter")
-            await asyncio.sleep(3)
 
-            # Enter এর পরেও check করো
-            try:
-                next_btn = page.locator("[data-testid='link-device-phone-num-next-btn']").first
-                is_disabled = await next_btn.is_disabled()
-                if not is_disabled:
-                    await next_btn.click()
-                    next_clicked = "enter-then-click"
-                    logger.info("✅ Next clicked after Enter")
-            except:
-                pass
-
-        # Method 3: JS click (last resort — disabled হলেও)
-        if not next_clicked or next_clicked == "enter":
-            result = await page.evaluate("""() => {
+        # Method 3: JS force (parallel — Enter এর পরেও)
+        try:
+            js_result = await page.evaluate("""() => {
                 let btn = document.querySelector("[data-testid='link-device-phone-num-next-btn']");
                 if (btn) {
-                    const isDisabled = btn.disabled || btn.getAttribute('aria-disabled') === 'true';
-                    if (!isDisabled) {
-                        btn.click();
-                        return 'js-enabled-click';
-                    }
-                    // Disabled হলেও try — last resort
                     btn.removeAttribute('disabled');
                     btn.removeAttribute('aria-disabled');
                     btn.click();
-                    return 'js-force';
+                    return 'js-ok';
                 }
-                // যেকোনো submit/next button
                 const btns = Array.from(document.querySelectorAll('button'));
                 for (const b of btns) {
                     const tid = b.getAttribute('data-testid') || '';
                     if (tid.includes('next') || b.type === 'submit') {
                         b.removeAttribute('disabled');
                         b.click();
-                        return 'fallback-submit';
+                        return 'submit-ok';
                     }
                 }
                 return 'not-found';
             }""")
-            if next_clicked != "enter":
-                next_clicked = result
-            logger.info(f"✅ JS click result: {result}")
+            logger.info(f"✅ JS parallel: {js_result}")
+        except:
+            pass
 
-        logger.info(f"📌 Final next method: {next_clicked}")
-        await asyncio.sleep(4)  # Code generate হওয়ার জন্য
+        logger.info(f"📌 next_clicked={next_clicked}")
+        await asyncio.sleep(2)  # WhatsApp server response wait
 
         # ─── Step 4: Pairing Code Extraction ───
         code = None
 
         for attempt in range(30):
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1 if attempt < 10 else 2)
             logger.info(f"🔍 Code scan attempt {attempt+1}/30")
 
             # ── Method 1: data-testid ──
