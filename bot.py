@@ -675,7 +675,7 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
 
 
 async def check_wa_number(phone: str, user_id: str):
-    """Check if number has WhatsApp — non-blocking version"""
+    """Check if number has WhatsApp — improved version with better timeout & selectors"""
     uid = str(user_id)
     sess = wa_sessions.get(uid, {})
     if not sess.get("connected") or not sess.get("page"):
@@ -685,43 +685,66 @@ async def check_wa_number(phone: str, user_id: str):
     digits = re.sub(r"\D", "", phone)
 
     try:
-        # page navigate করো
+        # Navigate to number check URL
         await page.goto(
             f"https://web.whatsapp.com/send?phone={digits}",
             wait_until="domcontentloaded",
-            timeout=15000
+            timeout=20000
         )
-        await asyncio.sleep(0)  # event loop কে yield করো
 
-        # ── Invalid number check — body text নয়, specific selector ──
-        # invalid number হলে এই popup/element আসে
-        for _ in range(20):  # max 4 seconds (20 × 0.2s)
-            await asyncio.sleep(0.2)  # প্রতিটা step এ yield
+        # Initial wait — WhatsApp Web needs time to process
+        await asyncio.sleep(3)
 
-            # Invalid number popup
+        # Check loop — max 10 seconds (50 × 0.2s)
+        for _ in range(50):
+            await asyncio.sleep(0.2)
+
+            # ── Invalid number check ──
+            # Only use specific popup-contents testid (NOT div[role='dialog'] — too broad)
             try:
-                invalid_el = page.locator(
-                    "[data-testid='popup-contents'], "
-                    "[data-testid='alert-dialog'], "
-                    "div[role='dialog']"
-                ).first
-                if await invalid_el.is_visible(timeout=100):
+                invalid_el = page.locator("[data-testid='popup-contents']").first
+                if await invalid_el.is_visible(timeout=200):
+                    text = ""
+                    try:
+                        text = (await invalid_el.inner_text(timeout=300)).lower()
+                    except:
+                        pass
+                    # Confirm it's actually the "invalid number" popup
+                    if any(kw in text for kw in ["invalid", "phone", "number", "not", "নম্বর", "ফোন"]):
+                        return False
+                    # Unknown popup — keep checking
+            except:
+                pass
+
+            # ── Also check alert-dialog separately ──
+            try:
+                alert_el = page.locator("[data-testid='alert-dialog']").first
+                if await alert_el.is_visible(timeout=200):
                     return False
             except:
                 pass
 
-            # Valid — compose box দেখা যাচ্ছে
+            # ── Valid number check — compose box visible ──
             try:
                 compose = page.locator(
-                    "div[data-testid='conversation-compose-box-input'], "
-                    "div[contenteditable='true'][data-tab]"
+                    "div[data-testid='conversation-compose-box-input']"
                 ).first
-                if await compose.is_visible(timeout=100):
+                if await compose.is_visible(timeout=200):
                     return True
             except:
                 pass
 
-        return None  # timeout — নিশ্চিত হওয়া গেল না
+            # ── Fallback: contenteditable compose box ──
+            try:
+                compose2 = page.locator(
+                    "div[contenteditable='true'][data-tab]"
+                ).first
+                if await compose2.is_visible(timeout=200):
+                    return True
+            except:
+                pass
+
+        return None  # timeout — could not determine
 
     except:
         return None
@@ -1113,7 +1136,7 @@ async def build_numbers_message(svc_id, cc, nums, wa_status_map=None):
     for i, n in enumerate(nums):
         if wa_status_map is not None:
             st = wa_status_map.get(n)
-            icon = " ✅" if st is True else (" ❌" if st is False else " ⬜")
+            icon = " 📱" if st is True else (" ✅" if st is False else " ⬜")
         else:
             icon = ""
         lines.append(f"{i+1}. `+{n}`{icon}")
