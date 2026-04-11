@@ -539,20 +539,19 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
             logger.info(f"✅ JS click result: {result}")
 
         logger.info(f"📌 Final next method: {next_clicked}")
-        await asyncio.sleep(8)  # Code generate হওয়ার জন্য পর্যাপ্ত সময়
+        await asyncio.sleep(4)  # Code generate হওয়ার জন্য
 
-        # ─── Step 4: Pairing Code Extraction — IMPROVED ───
+        # ─── Step 4: Pairing Code Extraction ───
         code = None
 
-        for attempt in range(20):
-            await asyncio.sleep(3)
-            logger.info(f"🔍 Code scan attempt {attempt+1}/20")
+        for attempt in range(30):
+            await asyncio.sleep(1.5)
+            logger.info(f"🔍 Code scan attempt {attempt+1}/30")
 
-            # ── Method 1: Specific data-testid container ──
+            # ── Method 1: data-testid ──
             for code_testid in [
                 "link-device-phone-num-code",
-                "pairing-code",
-                "otp",
+                "pairing-code", "otp", "code",
             ]:
                 try:
                     el = page.locator(f"[data-testid='{code_testid}']").first
@@ -560,16 +559,32 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
                     clean = re.sub(r'[^A-Z0-9]', '', txt.upper().strip())
                     if len(clean) == 8:
                         code = f"{clean[:4]}-{clean[4:]}"
-                        logger.info(f"🎉 Code via testid={code_testid}: {code}")
-                        break
-                    elif re.match(r'^[A-Z0-9]{4}-[A-Z0-9]{4}$', txt.upper().strip()):
-                        code = txt.upper().strip()
-                        logger.info(f"🎉 Code (formatted) via testid: {code}")
+                        logger.info(f"🎉 testid={code_testid}: {code}")
                         break
                 except:
                     pass
             if code:
                 break
+
+            # ── Method 1b: aria-label / role ──
+            try:
+                result = await page.evaluate("""() => {
+                    // data-testid এ 'code' আছে এমন সব element
+                    const byTestid = Array.from(document.querySelectorAll('[data-testid]'))
+                        .filter(el => el.getAttribute('data-testid').toLowerCase().includes('code'));
+                    for (const el of byTestid) {
+                        const t = (el.innerText || el.textContent || '').trim().replace(/[\s]+/g,'').toUpperCase();
+                        if (/^[A-Z0-9]{8}$/.test(t)) return t.slice(0,4)+'-'+t.slice(4);
+                        if (/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(t)) return t;
+                    }
+                    return null;
+                }""")
+                if result:
+                    code = result
+                    logger.info(f"🎉 Code via testid-contains-code: {code}")
+                    break
+            except:
+                pass
 
             # ── Method 2: JS evaluation — XXXX-XXXX বা XXXXXXXX pattern ──
             found = await page.evaluate("""() => {
@@ -600,13 +615,14 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
 
             logger.info(f"📦 JS found: {found[:5]}")
             if found:
-                # phone digits এর অংশ বাদ দাও
                 for candidate in found:
                     clean_c = re.sub(r'[^A-Z0-9]', '', candidate)
-                    if clean_c not in digits and clean_c[:4] not in digits and clean_c[4:] not in digits:
-                        code = candidate if '-' in candidate else f"{clean_c[:4]}-{clean_c[4:]}"
-                        logger.info(f"🎉 Code from JS eval: {code}")
-                        break
+                    # phone number এর exact match হলে বাদ দাও, নাহলে নাও
+                    if clean_c == digits or clean_c == digits[-8:]:
+                        continue
+                    code = candidate if '-' in candidate else f"{clean_c[:4]}-{clean_c[4:]}"
+                    logger.info(f"🎉 Code from JS eval: {code}")
+                    break
                 if code:
                     break
 
@@ -636,23 +652,75 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
                 return texts;
             }""")
 
+            # WhatsApp Web UI words যেগুলো code না
+            WA_UI_WORDS = {
+                "THEN", "LINK", "CODE", "NEXT", "BACK", "MORE", "SCAN",
+                "OPEN", "HOME", "HELP", "CHAT", "CALL", "MENU", "DONE",
+                "SENT", "FROM", "WITH", "THIS", "YOUR", "HAVE", "THAT",
+                "WHAT", "WHEN", "WILL", "BEEN", "ALSO", "THEY", "WHICH",
+                "PHONE", "NUMB", "DEVI", "REQU", "ENTE", "CLIC", "DIRE",
+                "HTTP", "HTTPS", "LOAD", "WAIT", "PLEA", "SIGN",
+            }
+
             chunks = []
             for t in all_texts:
                 clean = re.sub(r'[^A-Z0-9]', '', t.upper().strip())
                 if len(clean) == 4:
-                    # phone number এর substring হলে বাদ দাও
-                    if clean in digits:
+                    if clean in digits or clean == digits[-4:] or clean == digits[:4]:
+                        continue
+                    if clean in WA_UI_WORDS:
+                        continue
+                    # Purely alphabetic common words বাদ দাও
+                    if clean.isalpha() and clean in {
+                        "THEN", "LINK", "CODE", "NEXT", "BACK", "MORE",
+                        "SCAN", "OPEN", "HOME", "HELP", "CHAT", "CALL",
+                        "MENU", "DONE", "SENT", "FROM", "WITH", "THIS",
+                        "YOUR", "HAVE", "THAT", "WHAT", "WHEN", "WILL",
+                        "BEEN", "ALSO", "THEY", "SURE", "HERE", "JUST",
+                        "INTO", "OVER", "ONLY", "MAKE", "COME", "TAKE",
+                        "KNOW", "TIME", "YEAR", "GOOD", "SOME", "LIKE",
+                        "THAN", "EVEN", "MUCH", "WANT", "LOOK", "SUCH",
+                        "GIVE", "MOST", "TELL", "VERY", "WELL", "NEED",
+                    }:
                         continue
                     chunks.append(clean)
 
             logger.info(f"📦 chunks: {chunks[:10]}")
 
             if len(chunks) >= 2:
-                seen = list(dict.fromkeys(chunks))  # order-preserving unique
+                seen = list(dict.fromkeys(chunks))
                 if len(seen) >= 2:
                     code = f"{seen[0]}-{seen[1]}"
                     logger.info(f"🎉 Code from chunks: {code}")
                     break
+
+            # ── Method 5: পুরো body থেকে সব 4-char group নাও ──
+            try:
+                body_raw = await page.evaluate("() => document.body.innerText")
+                # সব 3-8 char alphanumeric words
+                all_words = re.findall(r'[A-Z0-9]{3,8}', body_raw.upper())
+                WA_BLACKLIST = {
+                    "THEN","LINK","CODE","NEXT","BACK","MORE","SCAN","OPEN",
+                    "HOME","HELP","CHAT","CALL","MENU","DONE","SENT","FROM",
+                    "WITH","THIS","YOUR","HAVE","THAT","WHAT","WHEN","WILL",
+                    "BEEN","ALSO","THEY","SURE","HERE","JUST","INTO","OVER",
+                    "ONLY","MAKE","COME","TAKE","KNOW","TIME","YEAR","GOOD",
+                    "SOME","LIKE","THAN","EVEN","MUCH","WANT","LOOK","SUCH",
+                    "GIVE","MOST","TELL","VERY","WELL","NEED","ENTE","HTTP",
+                    "NUMB","DEVI","REQU","CLIC","DIRE","LOAD","WAIT","PLEA",
+                    "SIGN","PHON","NOTI","FIED","INFO","PAGE","LOGO","ICON",
+                }
+                four_chars = [w for w in all_words if len(w) == 4
+                              and w not in digits and w != digits[-4:]
+                              and w not in WA_BLACKLIST]
+                logger.info(f"📦 body 4-char words: {four_chars[:15]}")
+                unique4 = list(dict.fromkeys(four_chars))
+                if len(unique4) >= 2:
+                    code = f"{unique4[0]}-{unique4[1]}"
+                    logger.info(f"🎉 Code from body words: {code}")
+                    break
+            except:
+                pass
 
             # ── Debug screenshot (attempt 5 এ) ──
             if attempt == 4:
@@ -2281,13 +2349,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await loading.delete()
             await update.message.reply_text(
                 f"🔑 Pairing Code\n\n"
-                f"{formatted}\n\n"
+                f"*{formatted}*\n\n"
+                f"⚠️ *এখনই enter করো — ৩০ সেকেন্ডে expire হয়!*\n\n"
                 f"Steps:\n"
                 f"1. WhatsApp খোলো\n"
                 f"2. Settings → Linked Devices\n"
                 f"3. Link a Device → Link with phone number\n"
-                f"4. উপরের code enter করো\n\n"
-                f"⏰ ১ মিনিটের মধ্যে expire হবে।",
+                f"4. উপরের code enter করো",
+                parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Check Status", callback_data="wa_status")],
                     [InlineKeyboardButton("🔄 New Code", callback_data="wa_connect")],
