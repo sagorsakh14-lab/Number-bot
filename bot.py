@@ -511,208 +511,92 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
         await asyncio.sleep(2)  # WhatsApp server response wait
 
         # ─── Step 4: Pairing Code Extraction ───
+        # WhatsApp Web এ code display হওয়ার জন্য অপেক্ষা করো
         code = None
 
-        for attempt in range(30):
-            await asyncio.sleep(1 if attempt < 10 else 2)
-            logger.info(f"🔍 Code scan attempt {attempt+1}/30")
+        for attempt in range(60):  # max 120 seconds
+            await asyncio.sleep(2)
+            logger.info(f"🔍 Code scan attempt {attempt+1}/60")
 
-            # ── Method 1: data-testid ──
-            for code_testid in [
-                "link-device-phone-num-code",
-                "pairing-code", "otp", "code",
-            ]:
-                try:
-                    el = page.locator(f"[data-testid='{code_testid}']").first
-                    txt = await el.inner_text(timeout=2000)
-                    clean = re.sub(r'[^A-Z0-9]', '', txt.upper().strip())
-                    if len(clean) == 8:
-                        code = f"{clean[:4]}-{clean[4:]}"
-                        logger.info(f"🎉 testid={code_testid}: {code}")
-                        break
-                except:
-                    pass
-            if code:
-                break
+            # ── Method 1: সবচেয়ে reliable — exact data-testid ──
+            try:
+                el = page.locator("[data-testid='link-device-phone-num-code']").first
+                txt = await el.inner_text(timeout=2000)
+                logger.info(f"🔎 testid raw text: '{txt}'")
+                clean = re.sub(r'[^A-Z0-9]', '', txt.upper().strip())
+                if len(clean) == 8:
+                    code = f"{clean[:4]}-{clean[4:]}"
+                    logger.info(f"🎉 Code via testid: {code}")
+                    break
+            except:
+                pass
 
-            # ── Method 1b: aria-label / role ──
+            # ── Method 2: JS — DOM এ সরাসরি খোঁজো ──
             try:
                 result = await page.evaluate("""() => {
-                    // data-testid এ 'code' আছে এমন সব element
-                    const byTestid = Array.from(document.querySelectorAll('[data-testid]'))
-                        .filter(el => el.getAttribute('data-testid').toLowerCase().includes('code'));
-                    for (const el of byTestid) {
-                        const t = (el.innerText || el.textContent || '').trim().replace(/[\s]+/g,'').toUpperCase();
-                        if (/^[A-Z0-9]{8}$/.test(t)) return t.slice(0,4)+'-'+t.slice(4);
-                        if (/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(t)) return t;
+                    // 1. data-testid যেগুলোতে 'code' আছে
+                    const els = Array.from(document.querySelectorAll('[data-testid]'));
+                    for (const el of els) {
+                        const tid = el.getAttribute('data-testid') || '';
+                        if (tid.includes('code') || tid.includes('pairing')) {
+                            const t = (el.innerText || el.textContent || '')
+                                .trim().replace(/\\s/g, '').toUpperCase();
+                            if (/^[A-Z0-9]{8}$/.test(t)) return t.slice(0,4)+'-'+t.slice(4);
+                            if (/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(t)) return t;
+                        }
+                    }
+
+                    // 2. Leaf node এ exactly XXXX-XXXX format
+                    const all = Array.from(document.querySelectorAll('span, div, p'));
+                    for (const el of all) {
+                        if (el.children.length === 0) {
+                            const t = (el.innerText || el.textContent || '').trim().toUpperCase();
+                            if (/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(t)) return t;
+                            if (/^[A-Z0-9]{8}$/.test(t)) return t.slice(0,4)+'-'+t.slice(4);
+                        }
                     }
                     return null;
                 }""")
                 if result:
-                    code = result
-                    logger.info(f"🎉 Code via testid-contains-code: {code}")
-                    break
+                    # Phone number এর সাথে match করলে বাদ দাও
+                    clean_r = re.sub(r'[^A-Z0-9]', '', result)
+                    if clean_r not in digits and clean_r not in digits[-8:]:
+                        code = result
+                        logger.info(f"🎉 Code via JS DOM: {code}")
+                        break
             except:
                 pass
 
-            # ── Method 2: JS evaluation — XXXX-XXXX বা XXXXXXXX pattern ──
-            found = await page.evaluate("""() => {
-                const results = [];
-                const all = Array.from(document.querySelectorAll('*'));
-                for (const el of all) {
-                    // শুধু leaf node (child element নেই)
-                    if (el.children.length === 0) {
-                        const t = (el.innerText || el.textContent || '').trim().toUpperCase();
-                        // XXXX-XXXX format
-                        if (/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(t)) {
-                            results.push(t);
-                        }
-                        // XXXXXXXX format (8 chars alphanumeric)
-                        if (/^[A-Z0-9]{8}$/.test(t)) {
-                            results.push(t.slice(0,4) + '-' + t.slice(4));
-                        }
-                    }
-                    // Container যে innerText এ XXXX-XXXX আছে
-                    const full = (el.innerText || '').trim().toUpperCase();
-                    const m = full.match(/\\b([A-Z0-9]{4})[\\s\\-]([A-Z0-9]{4})\\b/);
-                    if (m && results.length === 0) {
-                        results.push(m[1] + '-' + m[2]);
-                    }
-                }
-                return [...new Set(results)];
-            }""")
+            # ── Method 3: body text থেকে XXXX-XXXX pattern ──
+            try:
+                body_text = await page.evaluate("() => document.body.innerText")
+                logger.info(f"📄 Body snippet: {body_text[:300]}")
 
-            logger.info(f"📦 JS found: {found[:5]}")
-            if found:
-                for candidate in found:
-                    clean_c = re.sub(r'[^A-Z0-9]', '', candidate)
-                    # phone number এর exact match হলে বাদ দাও, নাহলে নাও
-                    if clean_c == digits or clean_c == digits[-8:]:
+                # Pattern: exactly XXXX-XXXX (4 alphanum dash 4 alphanum)
+                matches = re.findall(r'\b([A-Z0-9]{4})[- ]([A-Z0-9]{4})\b', body_text.upper())
+                for p1, p2 in matches:
+                    combined = p1 + p2
+                    # Phone number এর অংশ হলে skip
+                    if combined in digits or p1 in digits or p2 in digits:
                         continue
-                    code = candidate if '-' in candidate else f"{clean_c[:4]}-{clean_c[4:]}"
-                    logger.info(f"🎉 Code from JS eval: {code}")
+                    # Pure digits হলে skip (that's not a pairing code)
+                    if combined.isdigit():
+                        continue
+                    code = f"{p1}-{p2}"
+                    logger.info(f"🎉 Code from body: {code}")
                     break
                 if code:
                     break
-
-            # ── Method 3: body innerText থেকে regex match ──
-            body_text = await page.evaluate("() => document.body.innerText")
-            # XXXX-XXXX বা XXXX XXXX pattern — digit ও allow
-            for m in re.finditer(r'\b([A-Z0-9]{4})[\s\-]([A-Z0-9]{4})\b', body_text.upper()):
-                p1, p2 = m.group(1), m.group(2)
-                combined = p1 + p2
-                # phone number এর অংশ না হলে নাও
-                if combined not in digits and p1 not in digits[-8:] and p2 not in digits[-8:]:
-                    code = f"{p1}-{p2}"
-                    logger.info(f"🎉 Code from body regex: {code}")
-                    break
-            if code:
-                break
-
-            # ── Method 4: span/div থেকে 4-char chunks collect — digit ও allow ──
-            all_texts = await page.evaluate("""() => {
-                const texts = [];
-                document.querySelectorAll('span, div[class], p').forEach(el => {
-                    if (el.children.length === 0) {
-                        const t = (el.innerText || el.textContent || '').trim();
-                        if (t.length >= 2 && t.length <= 10) texts.push(t);
-                    }
-                });
-                return texts;
-            }""")
-
-            # WhatsApp Web UI words যেগুলো code না
-            WA_UI_WORDS = {
-                "THEN", "LINK", "CODE", "NEXT", "BACK", "MORE", "SCAN",
-                "OPEN", "HOME", "HELP", "CHAT", "CALL", "MENU", "DONE",
-                "SENT", "FROM", "WITH", "THIS", "YOUR", "HAVE", "THAT",
-                "WHAT", "WHEN", "WILL", "BEEN", "ALSO", "THEY", "WHICH",
-                "PHONE", "NUMB", "DEVI", "REQU", "ENTE", "CLIC", "DIRE",
-                "HTTP", "HTTPS", "LOAD", "WAIT", "PLEA", "SIGN",
-            }
-
-            chunks = []
-            for t in all_texts:
-                clean = re.sub(r'[^A-Z0-9]', '', t.upper().strip())
-                if len(clean) == 4:
-                    if clean in digits or clean == digits[-4:] or clean == digits[:4]:
-                        continue
-                    if clean in WA_UI_WORDS:
-                        continue
-                    # Purely alphabetic common words বাদ দাও
-                    if clean.isalpha() and clean in {
-                        "THEN", "LINK", "CODE", "NEXT", "BACK", "MORE",
-                        "SCAN", "OPEN", "HOME", "HELP", "CHAT", "CALL",
-                        "MENU", "DONE", "SENT", "FROM", "WITH", "THIS",
-                        "YOUR", "HAVE", "THAT", "WHAT", "WHEN", "WILL",
-                        "BEEN", "ALSO", "THEY", "SURE", "HERE", "JUST",
-                        "INTO", "OVER", "ONLY", "MAKE", "COME", "TAKE",
-                        "KNOW", "TIME", "YEAR", "GOOD", "SOME", "LIKE",
-                        "THAN", "EVEN", "MUCH", "WANT", "LOOK", "SUCH",
-                        "GIVE", "MOST", "TELL", "VERY", "WELL", "NEED",
-                    }:
-                        continue
-                    chunks.append(clean)
-
-            logger.info(f"📦 chunks: {chunks[:10]}")
-
-            if len(chunks) >= 2:
-                seen = list(dict.fromkeys(chunks))
-                if len(seen) >= 2:
-                    code = f"{seen[0]}-{seen[1]}"
-                    logger.info(f"🎉 Code from chunks: {code}")
-                    break
-
-            # ── Method 5: পুরো body থেকে সব 4-char group নাও ──
-            try:
-                body_raw = await page.evaluate("() => document.body.innerText")
-                # সব 3-8 char alphanumeric words
-                all_words = re.findall(r'[A-Z0-9]{3,8}', body_raw.upper())
-                WA_BLACKLIST = {
-                    "THEN","LINK","CODE","NEXT","BACK","MORE","SCAN","OPEN",
-                    "HOME","HELP","CHAT","CALL","MENU","DONE","SENT","FROM",
-                    "WITH","THIS","YOUR","HAVE","THAT","WHAT","WHEN","WILL",
-                    "BEEN","ALSO","THEY","SURE","HERE","JUST","INTO","OVER",
-                    "ONLY","MAKE","COME","TAKE","KNOW","TIME","YEAR","GOOD",
-                    "SOME","LIKE","THAN","EVEN","MUCH","WANT","LOOK","SUCH",
-                    "GIVE","MOST","TELL","VERY","WELL","NEED","ENTE","HTTP",
-                    "NUMB","DEVI","REQU","CLIC","DIRE","LOAD","WAIT","PLEA",
-                    "SIGN","PHON","NOTI","FIED","INFO","PAGE","LOGO","ICON",
-                }
-                four_chars = [w for w in all_words if len(w) == 4
-                              and w not in digits and w != digits[-4:]
-                              and w not in WA_BLACKLIST]
-                logger.info(f"📦 body 4-char words: {four_chars[:15]}")
-                unique4 = list(dict.fromkeys(four_chars))
-                if len(unique4) >= 2:
-                    code = f"{unique4[0]}-{unique4[1]}"
-                    logger.info(f"🎉 Code from body words: {code}")
-                    break
             except:
                 pass
-
-            # ── Debug screenshot (attempt 5 এ) ──
-            if attempt == 4:
-                try:
-                    screenshot_path = f"/tmp/wa_debug_{uid}_{attempt}.png"
-                    await page.screenshot(path=screenshot_path, full_page=False)
-                    logger.info(f"📸 Screenshot saved: {screenshot_path}")
-                    # body text log করো
-                    logger.info(f"📄 Body preview: {body_text[:500]}")
-                except Exception as se:
-                    logger.warning(f"Screenshot failed: {se}")
 
         if not code:
-            # Final attempt: full body text dump করো debug এর জন্য
             try:
                 body = await page.evaluate("() => document.body.innerText")
-                logger.error(f"❌ Code not found. Body text: {body[:1000]}")
+                logger.error(f"❌ Code not found after all attempts. Body:\n{body[:1500]}")
             except:
                 pass
-            raise Exception(
-                "Pairing code পাওয়া যায়নি। Phone এ notification দেখে manually enter করুন, "
-                "অথবা WhatsApp Web এর নতুন layout এর জন্য bot update দরকার।"
-            )
+            raise Exception("Pairing code পাওয়া যায়নি। কিছুক্ষণ পর আবার try করো।")
 
         return code
 
