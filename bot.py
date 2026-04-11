@@ -387,49 +387,77 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
             except:
                 raise Exception("'Link with phone number' button পাওয়া যায়নি")
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
-        # Phone input
+        # Phone input — multiple selectors try করো
         input_el = None
         for sel in [
             "input[data-testid='phone-number-input']",
             "input[type='tel']",
+            "input[placeholder*='phone']",
+            "input[placeholder*='number']",
+            "input[placeholder*='Phone']",
+            "input",
         ]:
             try:
                 el = page.locator(sel).first
-                await el.wait_for(state="visible", timeout=10000)
+                await el.wait_for(state="visible", timeout=8000)
+                await el.scroll_into_view_if_needed()
                 input_el = el
+                logger.info(f"✅ Input found: {sel}")
                 break
             except: continue
 
         if not input_el:
-            raise Exception("Phone input পাওয়া যায়নি")
-
-        await input_el.click()
-        await input_el.fill("")
-        await asyncio.sleep(0.3)
-        await input_el.type(digits, delay=60)
-        await asyncio.sleep(1)
-
-        # Next button
-        clicked = False
-        for sel in [
-            "button[data-testid='link-device-phone-num-next-btn']",
-            "button:has-text('Next')",
-            "div[role='button']:has-text('Next')",
-        ]:
+            # JS দিয়ে শেষ চেষ্টা
             try:
-                el = page.locator(sel).first
-                if await el.is_visible():
-                    await el.click()
-                    logger.info("✅ Next clicked")
+                await page.evaluate(f"""
+                    const inputs = document.querySelectorAll('input');
+                    for (const inp of inputs) {{
+                        inp.focus();
+                        inp.value = '{digits}';
+                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        break;
+                    }}
+                """)
+                logger.info("✅ Input filled via JS")
+                await asyncio.sleep(1)
+                # Next button JS click
+                await page.evaluate("""
+                    const btns = Array.from(document.querySelectorAll('button, div[role=button]'));
+                    const btn = btns.find(b => b.innerText && (b.innerText.includes('Next') || b.innerText.includes('next')));
+                    if (btn) btn.click();
+                """)
+                await asyncio.sleep(3)
+            except Exception as je:
+                raise Exception(f"Phone input পাওয়া যায়নি: {je}")
+        else:
+            await input_el.click()
+            await input_el.fill("")
+            await asyncio.sleep(0.3)
+            await input_el.type(digits, delay=80)
+            await asyncio.sleep(1)
+
+            # Next button
+            clicked = False
+            for sel in [
+                "button[data-testid='link-device-phone-num-next-btn']",
+                "button:has-text('Next')",
+                "div[role='button']:has-text('Next')",
+                "button[type='submit']",
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    await el.scroll_into_view_if_needed()
+                    await el.click(force=True)
+                    logger.info(f"✅ Next clicked: {sel}")
                     clicked = True
                     break
-            except: continue
-        if not clicked:
-            await input_el.press("Enter")
+                except: continue
+            if not clicked:
+                await input_el.press("Enter")
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
         # Pairing code
         code_el = None
