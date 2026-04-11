@@ -350,36 +350,55 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
     try:
         logger.info("🌐 Loading WhatsApp Web...")
         await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(5)
+        await asyncio.sleep(6)
 
-        # Step 1: "Link with phone number" button — JS দিয়ে click
-        clicked = await page.evaluate("""() => {
-            const all = Array.from(document.querySelectorAll('button, div[role="button"], span'));
-            const btn = all.find(el => el.innerText && el.innerText.toLowerCase().includes('phone number'));
-            if (btn) { btn.click(); return true; }
-            return false;
-        }""")
-        if not clicked:
-            # data-testid দিয়ে try
+        # Step 1: "Link with phone number" button click — multiple methods
+        clicked = False
+
+        # Method A: data-testid দিয়ে
+        for testid in ["link-device-phone-num-button", "link-with-phone-number"]:
             try:
-                el = page.locator("[data-testid='link-device-phone-num-button']").first
-                await el.wait_for(state="attached", timeout=15000)
-                await page.evaluate("el => el.click()", await el.element_handle())
+                el = page.locator(f"[data-testid='{testid}']").first
+                await el.wait_for(state="visible", timeout=5000)
+                await el.click()
                 clicked = True
-            except: pass
-        logger.info(f"✅ Phone btn click: {clicked}")
-        await asyncio.sleep(3)
+                logger.info(f"✅ Phone btn clicked via testid={testid}")
+                break
+            except:
+                pass
 
-        # Step 2: Country code dropdown + phone number input
-        await asyncio.sleep(2)
+        # Method B: JS text search
+        if not clicked:
+            clicked = await page.evaluate("""() => {
+                const keywords = ['phone number', 'link with phone', 'phone'];
+                const els = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'));
+                for (const el of els) {
+                    const txt = (el.innerText || '').toLowerCase();
+                    if (keywords.some(k => txt.includes(k))) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            logger.info(f"✅ Phone btn via JS text: {clicked}")
 
-        # Country code dropdown clear করো এবং শুধু local number দাও
-        # Bangladesh: +880, local number = digits[3:] (880 বাদ দিয়ে)
-        # WhatsApp Web এ country code আলাদা dropdown এ থাকে
+        # Method C: aria-label
+        if not clicked:
+            try:
+                el = page.get_by_role("button", name=re.compile("phone", re.IGNORECASE)).first
+                await el.click(timeout=5000)
+                clicked = True
+                logger.info("✅ Phone btn via aria-label")
+            except:
+                pass
+
+        await asyncio.sleep(4)
+
+        # Step 2: Country code + phone number input
         country_prefix = ""
         local_number = digits
-        # Common country codes
-        for prefix in ["880", "91", "92", "1", "44", "977"]:
+        for prefix in ["880", "91", "92", "1", "44", "977", "86", "81", "82", "66"]:
             if digits.startswith(prefix):
                 country_prefix = prefix
                 local_number = digits[len(prefix):]
@@ -387,62 +406,85 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
 
         logger.info(f"📱 Country: +{country_prefix}, Local: {local_number}")
 
-        # Phone input এ শুধু local number type করো
-        try:
-            inp_el = page.locator('input').first
-            await inp_el.wait_for(state="visible", timeout=8000)
-            await inp_el.click()
-            # আগের সব clear করো
-            await inp_el.press("Control+a")
-            await inp_el.press("Backspace")
-            await asyncio.sleep(0.5)
-            # Local number type করো
-            await inp_el.type(local_number, delay=120)
-            logger.info(f"✅ Typed: {local_number}")
-        except Exception as te:
-            logger.warning(f"⚠️ Input error: {te}")
-        await asyncio.sleep(2)
+        # Phone input — multiple selectors try করো
+        typed = False
+        input_selectors = [
+            "[data-testid='link-device-phone-num-input']",
+            "input[type='text']",
+            "input[inputmode='numeric']",
+            "input[type='tel']",
+            "input",
+        ]
+        for sel in input_selectors:
+            try:
+                inp_el = page.locator(sel).first
+                await inp_el.wait_for(state="visible", timeout=4000)
+                await inp_el.click()
+                await asyncio.sleep(0.3)
+                await inp_el.press("Control+a")
+                await inp_el.press("Delete")
+                await asyncio.sleep(0.3)
+                await inp_el.type(local_number, delay=100)
+                logger.info(f"✅ Typed local number via sel: {sel}")
+                typed = True
+                break
+            except:
+                pass
 
-        # Step 3: Next button — সব possible উপায়ে click
-        await asyncio.sleep(1)
+        if not typed:
+            # Fallback: keyboard type
+            await page.keyboard.press("Control+a")
+            await page.keyboard.type(local_number, delay=80)
+            logger.info("✅ Typed via keyboard fallback")
 
-        # Next button — number type করার পর enable হওয়া পর্যন্ত wait করো
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
+
+        # Step 3: Next button click — সব উপায়ে
         next_clicked = None
 
-        # Method 1: data-testid দিয়ে wait + click
-        for attempt in range(5):
+        # Method 1: data-testid wait loop
+        for attempt in range(6):
             try:
                 next_btn = page.locator("[data-testid='link-device-phone-num-next-btn']").first
                 await next_btn.wait_for(state="visible", timeout=3000)
                 is_disabled = await next_btn.is_disabled()
-                logger.info(f"🔘 Next btn disabled: {is_disabled}, attempt {attempt+1}")
+                logger.info(f"🔘 Next btn disabled={is_disabled}, attempt={attempt+1}")
                 if not is_disabled:
                     await next_btn.click()
                     next_clicked = "testid"
                     logger.info("✅ Next clicked via testid")
                     break
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.info(f"⚠️ testid attempt {attempt+1}: {e}")
+                await asyncio.sleep(1.5)
+            except:
                 await asyncio.sleep(1)
 
-        # Method 2: JS দিয়ে force click
+        # Method 2: JS force click (disabled attribute সরিয়ে)
         if not next_clicked:
             result = await page.evaluate("""() => {
-                const btn = document.querySelector("[data-testid='link-device-phone-num-next-btn']");
+                // Specific testid
+                let btn = document.querySelector("[data-testid='link-device-phone-num-next-btn']");
                 if (btn) {
                     btn.removeAttribute('disabled');
+                    btn.removeAttribute('aria-disabled');
                     btn.click();
-                    return 'js-click';
+                    return 'testid-force';
                 }
-                // সব button এর মধ্যে arrow বা submit খোঁজো
+                // Submit button
                 const btns = Array.from(document.querySelectorAll('button'));
                 for (const b of btns) {
-                    if (b.type === 'submit' || b.getAttribute('data-testid')?.includes('next')) {
+                    const testid = b.getAttribute('data-testid') || '';
+                    const txt = (b.innerText || '').toLowerCase();
+                    if (testid.includes('next') || b.type === 'submit' || txt === 'next') {
                         b.removeAttribute('disabled');
                         b.click();
-                        return 'submit-btn';
+                        return 'submit-force';
+                    }
+                }
+                // Arrow/chevron SVG button
+                for (const b of btns) {
+                    if (b.querySelector('svg')) {
+                        b.click();
+                        return 'svg-btn';
                     }
                 }
                 return null;
@@ -454,76 +496,146 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
         if not next_clicked:
             await page.keyboard.press("Enter")
             next_clicked = "enter"
-            logger.info("✅ Next via Enter")
+            logger.info("✅ Next via Enter key")
 
-        logger.info(f"✅ Final next method: {next_clicked}")
-        await asyncio.sleep(6)
+        logger.info(f"📌 Final next method: {next_clicked}")
+        await asyncio.sleep(7)  # Code generate হওয়ার জন্য বেশি সময় দাও
 
-        # Step 4: Pairing code extract
+        # ─── Step 4: Pairing Code Extraction — IMPROVED ───
         code = None
 
-        for attempt in range(15):
-            await asyncio.sleep(2)
-            logger.info(f"🔍 Code scan attempt {attempt+1}")
+        for attempt in range(20):
+            await asyncio.sleep(3)
+            logger.info(f"🔍 Code scan attempt {attempt+1}/20")
 
-            # Method 1: JS দিয়ে সব ছোট text element collect করো
-            # WhatsApp Web এ code আলাদা আলাদা span এ থাকে
-            all_texts = await page.evaluate("""() => {
-                const texts = [];
-                document.querySelectorAll('span, div, p').forEach(el => {
-                    const t = (el.innerText || el.textContent || '').trim();
-                    if (t.length >= 1 && t.length <= 6) texts.push(t);
-                });
-                return texts;
+            # ── Method 1: Specific data-testid container ──
+            for code_testid in [
+                "link-device-phone-num-code",
+                "pairing-code",
+                "otp",
+            ]:
+                try:
+                    el = page.locator(f"[data-testid='{code_testid}']").first
+                    txt = await el.inner_text(timeout=2000)
+                    clean = re.sub(r'[^A-Z0-9]', '', txt.upper().strip())
+                    if len(clean) == 8:
+                        code = f"{clean[:4]}-{clean[4:]}"
+                        logger.info(f"🎉 Code via testid={code_testid}: {code}")
+                        break
+                    elif re.match(r'^[A-Z0-9]{4}-[A-Z0-9]{4}$', txt.upper().strip()):
+                        code = txt.upper().strip()
+                        logger.info(f"🎉 Code (formatted) via testid: {code}")
+                        break
+                except:
+                    pass
+            if code:
+                break
+
+            # ── Method 2: JS evaluation — XXXX-XXXX বা XXXXXXXX pattern ──
+            found = await page.evaluate("""() => {
+                const results = [];
+                const all = Array.from(document.querySelectorAll('*'));
+                for (const el of all) {
+                    // শুধু leaf node (child element নেই)
+                    if (el.children.length === 0) {
+                        const t = (el.innerText || el.textContent || '').trim().toUpperCase();
+                        // XXXX-XXXX format
+                        if (/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(t)) {
+                            results.push(t);
+                        }
+                        // XXXXXXXX format (8 chars alphanumeric)
+                        if (/^[A-Z0-9]{8}$/.test(t)) {
+                            results.push(t.slice(0,4) + '-' + t.slice(4));
+                        }
+                    }
+                    // Container যে innerText এ XXXX-XXXX আছে
+                    const full = (el.innerText || '').trim().toUpperCase();
+                    const m = full.match(/\\b([A-Z0-9]{4})[\\s\\-]([A-Z0-9]{4})\\b/);
+                    if (m && results.length === 0) {
+                        results.push(m[1] + '-' + m[2]);
+                    }
+                }
+                return [...new Set(results)];
             }""")
 
-            # 4 char alphanumeric chunks খোঁজো
-            # phone number digits বাদ দিতে হবে
-            phone_digits = digits  # যেমন 8801304006503
-
-            chunks = []
-            for t in all_texts:
-                clean = re.sub(r'[^A-Z0-9]', '', t.upper().strip())
-                # 4 char হতে হবে
-                if len(clean) != 4:
-                    continue
-                # phone number এর substring হলে বাদ দাও
-                if clean in phone_digits:
-                    continue
-                # purely digit হলে বাদ দাও (real code এ letter থাকে)
-                if clean.isdigit():
-                    continue
-                chunks.append(clean)
-
-            logger.info(f"📦 chunks: {chunks[:8]}")
-
-            if len(chunks) >= 2:
-                seen = []
-                for c in chunks:
-                    if c not in seen:
-                        seen.append(c)
-                    if len(seen) == 2:
+            logger.info(f"📦 JS found: {found[:5]}")
+            if found:
+                # phone digits এর অংশ বাদ দাও
+                for candidate in found:
+                    clean_c = re.sub(r'[^A-Z0-9]', '', candidate)
+                    if clean_c not in digits and clean_c[:4] not in digits and clean_c[4:] not in digits:
+                        code = candidate if '-' in candidate else f"{clean_c[:4]}-{clean_c[4:]}"
+                        logger.info(f"🎉 Code from JS eval: {code}")
                         break
-                if len(seen) == 2:
-                    code = f"{seen[0]}-{seen[1]}"
-                    logger.info(f"🎉 Code from chunks: {code}")
+                if code:
                     break
 
-            # Method 2: body text — letter+digit mixed pattern (real pairing code)
+            # ── Method 3: body innerText থেকে regex match ──
             body_text = await page.evaluate("() => document.body.innerText")
-            # Real code এ letter থাকে — purely numeric হবে না
-            for m in re.finditer(r'([A-Z0-9]{4})[-\s]([A-Z0-9]{4})', body_text):
+            # XXXX-XXXX বা XXXX XXXX pattern — digit ও allow
+            for m in re.finditer(r'\b([A-Z0-9]{4})[\s\-]([A-Z0-9]{4})\b', body_text.upper()):
                 p1, p2 = m.group(1), m.group(2)
-                # phone number এর অংশ না হলেই নাও
-                if p1 not in phone_digits and p2 not in phone_digits:
+                combined = p1 + p2
+                # phone number এর অংশ না হলে নাও
+                if combined not in digits and p1 not in digits[-8:] and p2 not in digits[-8:]:
                     code = f"{p1}-{p2}"
-                    logger.info(f"🎉 Code from body: {code}")
+                    logger.info(f"🎉 Code from body regex: {code}")
                     break
             if code:
                 break
 
+            # ── Method 4: span/div থেকে 4-char chunks collect — digit ও allow ──
+            all_texts = await page.evaluate("""() => {
+                const texts = [];
+                document.querySelectorAll('span, div[class], p').forEach(el => {
+                    if (el.children.length === 0) {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (t.length >= 2 && t.length <= 10) texts.push(t);
+                    }
+                });
+                return texts;
+            }""")
+
+            chunks = []
+            for t in all_texts:
+                clean = re.sub(r'[^A-Z0-9]', '', t.upper().strip())
+                if len(clean) == 4:
+                    # phone number এর substring হলে বাদ দাও
+                    if clean in digits:
+                        continue
+                    chunks.append(clean)
+
+            logger.info(f"📦 chunks: {chunks[:10]}")
+
+            if len(chunks) >= 2:
+                seen = list(dict.fromkeys(chunks))  # order-preserving unique
+                if len(seen) >= 2:
+                    code = f"{seen[0]}-{seen[1]}"
+                    logger.info(f"🎉 Code from chunks: {code}")
+                    break
+
+            # ── Debug screenshot (attempt 5 এ) ──
+            if attempt == 4:
+                try:
+                    screenshot_path = f"/tmp/wa_debug_{uid}_{attempt}.png"
+                    await page.screenshot(path=screenshot_path, full_page=False)
+                    logger.info(f"📸 Screenshot saved: {screenshot_path}")
+                    # body text log করো
+                    logger.info(f"📄 Body preview: {body_text[:500]}")
+                except Exception as se:
+                    logger.warning(f"Screenshot failed: {se}")
+
         if not code:
-            raise Exception("Pairing code পাওয়া যায়নি — WhatsApp Web layout পরিবর্তন হয়েছে")
+            # Final attempt: full body text dump করো debug এর জন্য
+            try:
+                body = await page.evaluate("() => document.body.innerText")
+                logger.error(f"❌ Code not found. Body text: {body[:1000]}")
+            except:
+                pass
+            raise Exception(
+                "Pairing code পাওয়া যায়নি। Phone এ notification দেখে manually enter করুন, "
+                "অথবা WhatsApp Web এর নতুন layout এর জন্য bot update দরকার।"
+            )
 
         return code
 
