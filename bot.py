@@ -675,7 +675,7 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
 
 
 async def check_wa_number(phone: str, user_id: str):
-    """Check if number has WhatsApp using connected WA Web session"""
+    """Check if number has WhatsApp — non-blocking version"""
     uid = str(user_id)
     sess = wa_sessions.get(uid, {})
     if not sess.get("connected") or not sess.get("page"):
@@ -685,29 +685,44 @@ async def check_wa_number(phone: str, user_id: str):
     digits = re.sub(r"\D", "", phone)
 
     try:
+        # page navigate করো
         await page.goto(
             f"https://web.whatsapp.com/send?phone={digits}",
             wait_until="domcontentloaded",
-            timeout=20000
+            timeout=15000
         )
-        await asyncio.sleep(4)
+        await asyncio.sleep(0)  # event loop কে yield করো
 
-        body = await page.inner_text("body")
-        if "invalid" in body.lower() or "phone number shared" in body.lower():
-            return False
+        # ── Invalid number check — body text নয়, specific selector ──
+        # invalid number হলে এই popup/element আসে
+        for _ in range(20):  # max 4 seconds (20 × 0.2s)
+            await asyncio.sleep(0.2)  # প্রতিটা step এ yield
 
-        for sel in [
-            "div[data-testid='conversation-compose-box-input']",
-            "footer div[contenteditable='true']",
-            "div[contenteditable='true'][data-tab]",
-        ]:
+            # Invalid number popup
             try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=5000):
-                    return True
-            except: continue
+                invalid_el = page.locator(
+                    "[data-testid='popup-contents'], "
+                    "[data-testid='alert-dialog'], "
+                    "div[role='dialog']"
+                ).first
+                if await invalid_el.is_visible(timeout=100):
+                    return False
+            except:
+                pass
 
-        return None
+            # Valid — compose box দেখা যাচ্ছে
+            try:
+                compose = page.locator(
+                    "div[data-testid='conversation-compose-box-input'], "
+                    "div[contenteditable='true'][data-tab]"
+                ).first
+                if await compose.is_visible(timeout=100):
+                    return True
+            except:
+                pass
+
+        return None  # timeout — নিশ্চিত হওয়া গেল না
+
     except:
         return None
 
@@ -1088,6 +1103,29 @@ async def cb_select_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+async def build_numbers_message(svc_id, cc, nums, wa_status_map=None):
+    """নাম্বার message তৈরি করে। wa_status_map = {number: True/False/None}"""
+    country = countries.get(cc, {"flag": "🌍", "name": cc})
+    svc     = services.get(svc_id, {"icon": "📞", "name": svc_id})
+    price   = get_otp_price(cc)
+
+    lines = []
+    for i, n in enumerate(nums):
+        if wa_status_map is not None:
+            st = wa_status_map.get(n)
+            icon = " ✅" if st is True else (" ❌" if st is False else " ⬜")
+        else:
+            icon = ""
+        lines.append(f"{i+1}. `+{n}`{icon}")
+
+    msg = (
+        f"{svc['icon']} *{svc['name']}* — {country['flag']} *{country['name']}*\n"
+        f"💰 *Earnings per OTP:* {price:.2f} taka\n\n"
+        f"📞 *Your Numbers:*\n" + "\n".join(lines)
+    )
+    return msg
+
+
 async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await ensure_verified(update, context):
@@ -1108,7 +1146,6 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not nums:
         return await query.answer("❌ Not enough numbers available.", show_alert=True)
 
-    # Release old numbers
     for old in sess["current_numbers"]:
         active_numbers.pop(old, None)
     save_active()
@@ -1118,36 +1155,43 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sess["current_country"] = cc
     sess["last_number_time"] = now
 
-    country = countries.get(cc, {"flag": "🌍", "name": cc})
-    svc     = services.get(svc_id, {"icon": "📞", "name": svc_id})
-    price   = get_otp_price(cc)
-
-    nums_text_lines = []
     wa_connected = uid in wa_sessions and wa_sessions[uid].get("connected")
-    for i, n in enumerate(nums):
-        if wa_connected:
-            result = await check_wa_number(n, uid)
-            icon = " ✅" if result is True else (" ❌" if result is False else " ⬜")
-        else:
-            icon = ""
-        nums_text_lines.append(f"{i+1}. `+{n}`{icon}")
-    nums_text = "\n".join(nums_text_lines)
-
-    msg = (
-        f"{svc['icon']} *{svc['name']}* — {country['flag']} *{country['name']}*\n"
-        f"💰 *Earnings per OTP:* {price:.2f} taka\n\n"
-        f"📞 *Your Numbers:*\n{nums_text}"
-    )
-
-    buttons = [
+    msg = await build_numbers_message(svc_id, cc, nums)
+    if wa_connected:
+        msg += "\n\n_\u23f3 WhatsApp checking..._"
+    s_buttons = [
         [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
         [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
     ]
     if not wa_connected:
-        buttons.append([InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")])
+        s_buttons.append([InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")])
+    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(s_buttons))
 
-    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    if wa_connected:
+        _svc_id, _cc, _nums, _uid = svc_id, cc, nums[:], uid
+        async def wa_check_task_sc():
+            try:
+                wa_map = {}
+                for n in _nums:
+                    try:
+                        wa_map[n] = await check_wa_number(n, _uid)
+                    except:
+                        wa_map[n] = None
+                    await asyncio.sleep(0)
+                updated_msg = await build_numbers_message(_svc_id, _cc, _nums, wa_status_map=wa_map)
+                final_btns = [
+                    [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
+                    [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{_svc_id}:{_cc}")],
+                    [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
+                ]
+                try:
+                    await query.edit_message_text(updated_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(final_btns))
+                except:
+                    pass
+            except Exception as e:
+                logger.warning(f"WA check task error (sc): {e}")
+        asyncio.create_task(wa_check_task_sc())
 
 async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1176,35 +1220,96 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sess["current_numbers"] = nums
     sess["last_number_time"] = now
 
-    country = countries.get(cc, {"flag": "🌍", "name": cc})
-    svc     = services.get(svc_id, {"icon": "📞", "name": svc_id})
-    price   = get_otp_price(cc)
     wa_connected = uid in wa_sessions and wa_sessions[uid].get("connected")
-    nums_text_lines = []
-    for i, n in enumerate(nums):
-        if wa_connected:
-            result = await check_wa_number(n, uid)
-            icon = " ✅" if result is True else (" ❌" if result is False else " ⬜")
-        else:
-            icon = ""
-        nums_text_lines.append(f"{i+1}. `+{n}`{icon}")
-    nums_text = "\n".join(nums_text_lines)
-
-    msg = (
-        f"{svc['icon']} *{svc['name']}* — {country['flag']} *{country['name']}*\n"
-        f"💰 *Earnings per OTP:* {price:.2f} taka\n\n"
-        f"📞 *Your Numbers:*\n{nums_text}"
-    )
-
-    buttons = [
+    msg = await build_numbers_message(svc_id, cc, nums)
+    if wa_connected:
+        msg += "\n\n_\u23f3 WhatsApp checking..._"
+    n_buttons = [
         [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
         [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
     ]
     if not wa_connected:
-        buttons.append([InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")])
+        n_buttons.append([InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")])
+    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(n_buttons))
 
-    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    if wa_connected:
+        _svc_id2, _cc2, _nums2, _uid2 = svc_id, cc, nums[:], uid
+        async def wa_check_task_nn():
+            try:
+                wa_map = {}
+                for n in _nums2:
+                    try:
+                        wa_map[n] = await check_wa_number(n, _uid2)
+                    except:
+                        wa_map[n] = None
+                    await asyncio.sleep(0)
+                updated_msg = await build_numbers_message(_svc_id2, _cc2, _nums2, wa_status_map=wa_map)
+                final_btns = [
+                    [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
+                    [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{_svc_id2}:{_cc2}")],
+                    [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
+                ]
+                try:
+                    await query.edit_message_text(updated_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(final_btns))
+                except:
+                    pass
+            except Exception as e:
+                logger.warning(f"WA check task error (nn): {e}")
+        asyncio.create_task(wa_check_task_nn())
+
+async def cb_wa_check_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User manually চাপলে WA check করে — শুধু এই user এর জন্য, others unaffected"""
+    query = update.callback_query
+    await query.answer("⏳ WhatsApp check শুরু হচ্ছে...")
+    _, svc_id, cc = query.data.split(":")
+    uid  = str(update.effective_user.id)
+    sess = get_session(uid)
+    nums = sess.get("current_numbers", [])
+
+    if not nums:
+        return await query.answer("❌ No numbers found.", show_alert=True)
+
+    wa_connected = uid in wa_sessions and wa_sessions[uid].get("connected")
+    if not wa_connected:
+        return await query.answer("❌ WhatsApp connected নেই।", show_alert=True)
+
+    # "Checking..." message দেখাও
+    msg = await build_numbers_message(svc_id, cc, nums)
+    msg += "\n\n_⏳ WhatsApp checking..._"
+    buttons = [
+        [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
+        [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
+        [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
+    ]
+    try:
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    except:
+        pass
+
+    # প্রতিটা নাম্বার check করো — একটার পর একটা
+    wa_map = {}
+    for n in nums:
+        try:
+            wa_map[n] = await check_wa_number(n, uid)
+        except:
+            wa_map[n] = None
+        # প্রতিটা check শেষে event loop কে সুযোগ দাও
+        await asyncio.sleep(0)
+
+    # Final result দেখাও
+    updated_msg = await build_numbers_message(svc_id, cc, nums, wa_status_map=wa_map)
+    done_buttons = [
+        [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
+        [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
+        [InlineKeyboardButton("🔍 Re-check WA", callback_data=f"wacheck:{svc_id}:{cc}")],
+        [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
+    ]
+    try:
+        await query.edit_message_text(updated_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(done_buttons))
+    except:
+        pass
+
 
 async def cb_back_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2816,6 +2921,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_select_country, pattern="^cc:"))
     app.add_handler(CallbackQueryHandler(cb_new_numbers, pattern="^newnum:"))
     app.add_handler(CallbackQueryHandler(cb_back_services, pattern="^back_services$"))
+    app.add_handler(CallbackQueryHandler(cb_wa_check_numbers, pattern="^wacheck:"))
 
     app.add_handler(CallbackQueryHandler(cb_start_withdraw, pattern="^start_withdraw$"))
     app.add_handler(CallbackQueryHandler(cb_withdraw_method, pattern="^wm:"))
