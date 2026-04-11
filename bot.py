@@ -2160,19 +2160,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.error(f"WA connect error: {e}")
-            err_msg = str(e)[:120].replace("*","").replace("`","").replace("_","")
+            err_msg = str(e)[:150].replace("*","").replace("`","").replace("_","")
             try:
                 await loading.delete()
             except:
                 pass
             try:
                 await update.message.reply_text(
-                    f"❌ Pairing code পাওয়া যায়নি।\n\n"
-                    f"কারণ: {err_msg}\n\n"
-                    f"আবার চেষ্টা করুন।",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 আবার চেষ্টা করুন", callback_data="wa_connect")]
-                    ])
+                    f"❌ *Pairing code পাওয়া যায়নি।*\n\n"
+                    f"সম্ভাব্য কারণ:\n"
+                    f"• Server এ Chromium install নেই\n"
+                    f"• WhatsApp Web load হয়নি\n"
+                    f"• Network timeout\n\n"
+                    f"Error: {err_msg}\n\n"
+                    f"কিছুক্ষণ পর আবার চেষ্টা করুন।",
+                    parse_mode="Markdown"
                 )
             except:
                 pass
