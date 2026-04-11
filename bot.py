@@ -370,58 +370,62 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
         logger.info(f"✅ Phone btn click: {clicked}")
         await asyncio.sleep(3)
 
-        # Step 2: Phone number input — JS দিয়ে fill
+        # Step 2: Phone number input — React-compatible fill
         filled = await page.evaluate(f"""() => {{
-            // সব input খোঁজো
             const inputs = Array.from(document.querySelectorAll('input'));
             for (const inp of inputs) {{
                 inp.focus();
-                // React input value setter
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                nativeInputValueSetter.call(inp, '{digits}');
-                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                // React native input value setter
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(inp, '{digits}');
+                // React এর জন্য সব event fire করো
+                ['input', 'change', 'keyup', 'keydown'].forEach(ev => {{
+                    inp.dispatchEvent(new Event(ev, {{bubbles: true, cancelable: true}}));
+                }});
                 return true;
             }}
             return false;
         }}""")
         logger.info(f"✅ Input filled: {filled}")
+        await asyncio.sleep(1)
+
+        # Keyboard দিয়ে character by character type করো (React এর জন্য সবচেয়ে reliable)
+        try:
+            inp_el = page.locator('input').first
+            await inp_el.wait_for(state="visible", timeout=5000)
+            await inp_el.click()
+            await inp_el.fill("")
+            await asyncio.sleep(0.3)
+            for ch in digits:
+                await inp_el.type(ch, delay=100)
+            logger.info(f"✅ Typed digit by digit: {digits}")
+        except Exception as te:
+            logger.info(f"⚠️ Type fallback: {te}")
         await asyncio.sleep(2)
 
         # Step 3: Next button — সব possible উপায়ে click
         await asyncio.sleep(1)
 
-        next_clicked = await page.evaluate("""() => {
-            // Method 1: data-testid
-            const byTestId = document.querySelector("[data-testid='link-device-phone-num-next-btn']");
-            if (byTestId) { byTestId.click(); return 'testid'; }
+        # Next button — data-testid দিয়ে সরাসরি
+        next_clicked = None
+        try:
+            next_btn = page.locator("[data-testid='link-device-phone-num-next-btn']").first
+            await next_btn.wait_for(state="visible", timeout=5000)
+            await next_btn.scroll_into_view_if_needed()
+            await next_btn.click(force=True)
+            next_clicked = "testid"
+            logger.info("✅ Next clicked via testid")
+        except:
+            pass
 
-            // Method 2: arrow/submit button (WhatsApp Web এ → arrow button)
-            const allBtns = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'));
-            
-            // type=submit button
-            const submitBtn = document.querySelector('button[type="submit"]');
-            if (submitBtn) { submitBtn.click(); return 'submit'; }
+        if not next_clicked:
+            # Enter key
+            await page.keyboard.press("Enter")
+            next_clicked = "enter"
+            logger.info("✅ Next via Enter key")
 
-            // Next text
-            const nextBtn = allBtns.find(b => {
-                const t = (b.innerText || b.textContent || '').toLowerCase().trim();
-                return t === 'next' || t === '→' || t === '>' || t === 'ok';
-            });
-            if (nextBtn) { nextBtn.click(); return 'next-text'; }
-
-            // শেষ button
-            if (allBtns.length > 0) {
-                allBtns[allBtns.length - 1].click();
-                return 'last-btn';
-            }
-            return null;
-        }""")
         logger.info(f"✅ Next click method: {next_clicked}")
-
-        # Enter key দিয়েও try করো
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(5)
+        await asyncio.sleep(6)
 
         # Step 4: Pairing code extract
         code = None
