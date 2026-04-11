@@ -1184,8 +1184,7 @@ async def cb_wa_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sess["state"] = "wa_waiting_number"
     await context.bot.send_message(
         update.effective_user.id,
-        "📱 *WhatsApp Connect*\n\nতোমার WhatsApp নম্বর দাও *(country code সহ)*:\nExample: `8801712345678`",
-        parse_mode="Markdown"
+        "📱 WhatsApp Connect\n\nতোমার WhatsApp নম্বর দাও (country code সহ):\nExample: 8801712345678"
     )
 
 async def cb_wa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1205,10 +1204,10 @@ async def cb_wa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
     conn  = uid in wa_sessions and wa_sessions[uid].get("connected")
-    text  = "✅ *WhatsApp connected!*\n\nNumber assign হলে ✅/❌ দেখাবে।" if conn else "🔴 *WhatsApp connected নেই।*\n\nCode enter করলে আবার Check Status চাপো।"
+    text  = "✅ WhatsApp connected!\n\nNumber assign হলে ✅/❌ দেখাবে।" if conn else "🔴 WhatsApp connected নেই।\n\nCode enter করলে আবার Check Status চাপো।"
     btns  = [[InlineKeyboardButton("🔴 Disconnect", callback_data="wa_disconnect")]] if conn else \
             [[InlineKeyboardButton("📱 Connect", callback_data="wa_connect")]]
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(btns))
 
 async def cb_wa_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
