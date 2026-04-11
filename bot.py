@@ -299,132 +299,420 @@ def generate_totp(secret: str):
         return None
 
 # ─── WhatsApp Pairing via Playwright ───
-async def get_wa_pairing_code(phone: str) -> str:
-    """Get WhatsApp pairing code via phone number linking on WhatsApp Web"""
-    digits = re.sub(r"\D", "", phone)
-    logger.info(f"📱 WA pairing code for: +{digits}")
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ]
-        )
-        page = await browser.new_page(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            )
-        )
-
-        try:
-            # ── Step 1: Load WhatsApp Web ──
-            logger.info("🌐 Loading WhatsApp Web...")
-            await page.goto("https://web.whatsapp.com/", timeout=60000)
-
-            # Wait for the "Link with phone number" button — WhatsApp Web loads this on the QR page
-            logger.info("⏳ Waiting for link-with-phone button...")
-            await page.wait_for_selector(
-                "[data-testid='link-device-phone-num-button'], "
-                "button:has-text('Link with phone number'), "
-                "div[role='button']:has-text('phone')",
-                timeout=40000,
-                state="visible"
-            )
-
-            # ── Step 2: Click "Link with phone number" ──
-            for sel in [
-                "[data-testid='link-device-phone-num-button']",
-                "button:has-text('Link with phone number')",
-                "div[role='button']:has-text('Link with phone number')",
-            ]:
-                try:
-                    el = page.locator(sel).first
-                    if await el.is_visible():
-                        await el.click()
-                        logger.info(f"✅ Clicked phone button")
-                        break
-                except:
-                    continue
-
-            # ── Step 3: Wait for phone input and fill ──
-            logger.info(f"📞 Entering: +{digits}")
-            await page.wait_for_selector(
-                "input[type='tel'], input[data-testid='phone-number-input']",
-                timeout=15000,
-                state="visible"
-            )
-            phone_input = page.locator("input[type='tel'], input[data-testid='phone-number-input']").first
-            await phone_input.click()
-            await phone_input.fill(digits)
-
-            # ── Step 4: Click Next ──
-            for sel in [
-                "[data-testid='link-device-phone-num-next-btn']",
-                "button:has-text('Next')",
-                "div[role='button']:has-text('Next')",
-            ]:
-                try:
-                    el = page.locator(sel).first
-                    if await el.is_visible():
-                        await el.click()
-                        logger.info("✅ Clicked Next")
-                        break
-                except:
-                    continue
-            else:
-                await phone_input.press("Enter")
-
-            # ── Step 5: Wait for pairing code ──
-            logger.info("🔍 Waiting for pairing code...")
-            await page.wait_for_selector(
-                "[data-testid='device-link-passkey'], "
-                "[data-testid='pairing-code'], "
-                "div[data-testid*='passkey']",
-                timeout=30000,
-                state="visible"
-            )
-
-            code_el = page.locator(
-                "[data-testid='device-link-passkey'], "
-                "[data-testid='pairing-code'], "
-                "div[data-testid*='passkey']"
-            ).first
-            raw = (await code_el.inner_text()).strip()
-            code = re.sub(r"[^A-Z0-9]", "", raw.upper())
-
-            if len(code) < 8:
-                raise Exception(f"Invalid code received: '{raw}'")
-
-            result = code[:4] + "-" + code[4:8]
-            logger.info(f"🎉 Pairing code: {result}")
-            return result
-
-        finally:
-            await browser.close()
-async def check_wa_number(phone: str, user_id: str) -> bool:
-    """Check if a number is on WhatsApp"""
+async def get_wa_pairing_code(phone: str, user_id: str) -> str:
     uid = str(user_id)
-    if uid not in wa_sessions or not wa_sessions[uid].get("connected"):
-        return None
+    digits = re.sub(r"\D", "", phone)
+    logger.info(f"📱 WA pairing for: +{digits}")
+
+    # পুরনো session বন্ধ করো
+    old = wa_sessions.get(uid, {})
+    if old.get("browser"):
+        try: await old["browser"].close()
+        except: pass
+    if old.get("pw"):
+        try: await old["pw"].stop()
+        except: pass
+    wa_sessions[uid] = {"browser": None, "page": None, "connected": False, "pw": None}
+
+    chromium_path = (
+        os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or
+        shutil.which("chromium") or
+        shutil.which("chromium-browser") or
+        ("/usr/bin/chromium" if os.path.exists("/usr/bin/chromium") else None)
+    )
+
+    pw_instance = await async_playwright().start()
+    launch_opts = dict(
+        headless=True,
+        args=[
+            "--no-sandbox", "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage", "--disable-gpu",
+            "--single-process", "--no-zygote",
+            "--window-size=1280,900",
+        ]
+    )
+    if chromium_path:
+        launch_opts["executable_path"] = chromium_path
+
+    browser = await pw_instance.chromium.launch(**launch_opts)
+    page = await browser.new_page(
+        viewport={"width": 1280, "height": 900},
+        user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+    )
+    wa_sessions[uid]["browser"] = browser
+    wa_sessions[uid]["page"] = page
+    wa_sessions[uid]["pw"] = pw_instance
 
     try:
-        page = wa_sessions[uid].get("page")
-        if not page:
-            return None
+        logger.info("🌐 Loading WhatsApp Web...")
+        await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(4)
 
-        clean = re.sub(r"\D", "", phone)
-        # Use WhatsApp Web search to check if number exists
-        url = f"https://wa.me/{clean}"
-        # This is a simplified check — actual implementation varies
-        return True
+        # Step 1: "Link with phone number" button click — multiple methods
+        clicked = False
+
+        # Method A: data-testid দিয়ে
+        for testid in ["link-device-phone-num-button", "link-with-phone-number"]:
+            try:
+                el = page.locator(f"[data-testid='{testid}']").first
+                await el.wait_for(state="visible", timeout=5000)
+                await el.click()
+                clicked = True
+                logger.info(f"✅ Phone btn clicked via testid={testid}")
+                break
+            except:
+                pass
+
+        # Method B: JS text search
+        if not clicked:
+            clicked = await page.evaluate("""() => {
+                const keywords = ['phone number', 'link with phone', 'phone'];
+                const els = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'));
+                for (const el of els) {
+                    const txt = (el.innerText || '').toLowerCase();
+                    if (keywords.some(k => txt.includes(k))) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            logger.info(f"✅ Phone btn via JS text: {clicked}")
+
+        # Method C: aria-label
+        if not clicked:
+            try:
+                el = page.get_by_role("button", name=re.compile("phone", re.IGNORECASE)).first
+                await el.click(timeout=5000)
+                clicked = True
+                logger.info("✅ Phone btn via aria-label")
+            except:
+                pass
+
+        await asyncio.sleep(3)
+
+        # Step 2: Country code + phone number input
+        country_prefix = ""
+        local_number = digits
+        for prefix in ["880", "91", "92", "1", "44", "977", "86", "81", "82", "66"]:
+            if digits.startswith(prefix):
+                country_prefix = prefix
+                local_number = digits[len(prefix):]
+                break
+
+        logger.info(f"📱 Country: +{country_prefix}, Local: {local_number}")
+
+        # ── React-compatible input method ──
+        # WhatsApp Web React এর জন্য nativeInputValueSetter + dispatchEvent দরকার
+        react_set_result = await page.evaluate(f"""() => {{
+            // React controlled input value set করার সঠিক পদ্ধতি
+            function setReactValue(el, value) {{
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeInputValueSetter.call(el, value);
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                el.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true }}));
+            }}
+
+            const allInputs = Array.from(document.querySelectorAll('input'));
+            const visibleInputs = allInputs.filter(el => el.offsetParent !== null);
+            
+            console.log('Visible inputs count:', visibleInputs.length);
+            
+            if (visibleInputs.length === 0) {{
+                return {{ success: false, msg: 'No visible inputs found', count: allInputs.length }};
+            }}
+            
+            if (visibleInputs.length >= 2) {{
+                // দুটো field: country code + local number
+                setReactValue(visibleInputs[0], '{country_prefix}');
+                setReactValue(visibleInputs[1], '{local_number}');
+                visibleInputs[1].focus();
+                return {{ success: true, msg: 'two-field', cc: '{country_prefix}', num: '{local_number}' }};
+            }} else {{
+                // একটাই field — full digits
+                setReactValue(visibleInputs[0], '{digits}');
+                visibleInputs[0].focus();
+                return {{ success: true, msg: 'single-field', full: '{digits}' }};
+            }}
+        }}""")
+        logger.info(f"⌨️ React input result: {react_set_result}")
+
+        await asyncio.sleep(3)
+
+        # React state update নিশ্চিত করতে আরেকবার trigger
+        await page.evaluate("""() => {
+            const visibleInputs = Array.from(document.querySelectorAll('input')).filter(el => el.offsetParent !== null);
+            visibleInputs.forEach(el => {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+        }""")
+
+        await asyncio.sleep(2)
+
+        # Step 3: Next button — fast approach
+        next_clicked = None
+
+        # Method 1: testid enabled হলে click (max 3 attempts, 1s each)
+        for attempt in range(3):
+            try:
+                next_btn = page.locator("[data-testid='link-device-phone-num-next-btn']").first
+                await next_btn.wait_for(state="visible", timeout=2000)
+                is_disabled = await next_btn.is_disabled()
+                logger.info(f"🔘 Next disabled={is_disabled} attempt={attempt+1}")
+                if not is_disabled:
+                    await next_btn.click()
+                    next_clicked = "testid"
+                    logger.info("✅ Next clicked (testid)")
+                    break
+                await asyncio.sleep(1)
+            except:
+                await asyncio.sleep(0.5)
+
+        # Method 2: Enter key — সবচেয়ে fast
+        if not next_clicked:
+            await page.keyboard.press("Enter")
+            next_clicked = "enter"
+            logger.info("✅ Next via Enter")
+
+        # Method 3: JS force (parallel — Enter এর পরেও)
+        try:
+            js_result = await page.evaluate("""() => {
+                let btn = document.querySelector("[data-testid='link-device-phone-num-next-btn']");
+                if (btn) {
+                    btn.removeAttribute('disabled');
+                    btn.removeAttribute('aria-disabled');
+                    btn.click();
+                    return 'js-ok';
+                }
+                const btns = Array.from(document.querySelectorAll('button'));
+                for (const b of btns) {
+                    const tid = b.getAttribute('data-testid') || '';
+                    if (tid.includes('next') || b.type === 'submit') {
+                        b.removeAttribute('disabled');
+                        b.click();
+                        return 'submit-ok';
+                    }
+                }
+                return 'not-found';
+            }""")
+            logger.info(f"✅ JS parallel: {js_result}")
+        except:
+            pass
+
+        logger.info(f"📌 next_clicked={next_clicked}")
+        await asyncio.sleep(2)  # WhatsApp server response wait
+
+        # ─── Step 4: Pairing Code Extraction ───
+        code = None
+
+        WORD_BLACKLIST = {
+            "THEN","LINK","CODE","NEXT","BACK","MORE","SCAN","OPEN","HOME",
+            "HELP","CHAT","CALL","MENU","DONE","SENT","FROM","WITH","THIS",
+            "YOUR","HAVE","THAT","WHAT","WHEN","WILL","BEEN","ALSO","THEY",
+            "SURE","HERE","JUST","INTO","OVER","ONLY","MAKE","COME","TAKE",
+            "KNOW","TIME","YEAR","GOOD","SOME","LIKE","THAN","EVEN","MUCH",
+            "WANT","LOOK","SUCH","GIVE","MOST","TELL","VERY","WELL","NEED",
+            "PHON","NUMB","DEVI","REQU","ENTE","CLIC","DIRE","LOAD","WAIT",
+            "PLEA","SIGN","NOTI","INFO","PAGE","LOGO","ICON","EDIT","TYPE",
+            "STEP","SHOW","USED","MUST","ONCE","DOES","SEND","KEEP","WORD",
+            "AWAY","BOTH","FIND","FORM","ABLE","EVER","WORK","FACE","NEAR",
+            "LATE","LIVE","TURN","PLAY","MOVE","REAL","LEFT","HOLD","PLAN",
+            "FULL","LAST","NAME","STOP","MARK","MAIN","FEEL","SIDE","PAST",
+        }
+
+        for attempt in range(60):
+            await asyncio.sleep(2)
+            logger.info(f"🔍 Code scan {attempt+1}/60")
+
+            # ── Method 1: data-testid ──
+            try:
+                el = page.locator("[data-testid='link-device-phone-num-code']").first
+                txt = await el.inner_text(timeout=2000)
+                logger.info(f"🔎 testid raw: '{txt}'")
+                clean = re.sub(r'[^A-Z0-9]', '', txt.upper())
+                if len(clean) == 8:
+                    p1, p2 = clean[:4], clean[4:]
+                    if p1 not in WORD_BLACKLIST and p2 not in WORD_BLACKLIST:
+                        code = f"{p1}-{p2}"
+                        logger.info(f"🎉 Code testid: {code}")
+                        break
+            except:
+                pass
+
+            # ── Method 2: individual character boxes collect ──
+            # WhatsApp Web প্রতিটা character আলাদা box এ দেখায়
+            try:
+                chars = await page.evaluate("""() => {
+                    // pairing code area খোঁজো
+                    // সাধারণত একটা container এ 8টা single-char span/div থাকে
+                    const containers = Array.from(document.querySelectorAll('div, section, article'));
+                    
+                    for (const container of containers) {
+                        // Direct children যেগুলো single char
+                        const children = Array.from(container.children);
+                        const singleChars = children.filter(el => {
+                            const t = (el.innerText || el.textContent || '').trim();
+                            return /^[A-Z0-9]$/i.test(t);
+                        });
+                        
+                        if (singleChars.length === 8) {
+                            return singleChars.map(el => 
+                                (el.innerText || el.textContent || '').trim().toUpperCase()
+                            ).join('');
+                        }
+                        
+                        // Nested single chars
+                        const allSpans = Array.from(container.querySelectorAll('span, div'));
+                        const charSpans = allSpans.filter(el => {
+                            if (el.children.length > 0) return false;
+                            const t = (el.innerText || el.textContent || '').trim();
+                            return /^[A-Z0-9]$/i.test(t);
+                        });
+                        
+                        if (charSpans.length === 8) {
+                            const code = charSpans.map(el =>
+                                (el.innerText || el.textContent || '').trim().toUpperCase()
+                            ).join('');
+                            return code;
+                        }
+                    }
+                    return null;
+                }""")
+                if chars and len(chars) == 8:
+                    p1, p2 = chars[:4], chars[4:]
+                    if p1 not in WORD_BLACKLIST and p2 not in WORD_BLACKLIST:
+                        code = f"{p1}-{p2}"
+                        logger.info(f"🎉 Code from char boxes: {code}")
+                        break
+            except:
+                pass
+
+            # ── Method 3: JS DOM — testid contains code ──
+            try:
+                result = await page.evaluate("""() => {
+                    const els = Array.from(document.querySelectorAll('[data-testid]'));
+                    for (const el of els) {
+                        const tid = (el.getAttribute('data-testid') || '').toLowerCase();
+                        if (tid.includes('code') || tid.includes('pairing')) {
+                            const t = (el.innerText || el.textContent || '')
+                                .trim().replace(/\\s/g,'').toUpperCase();
+                            if (/^[A-Z0-9]{8}$/.test(t)) return t.slice(0,4)+'-'+t.slice(4);
+                            if (/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(t)) return t;
+                        }
+                    }
+                    // leaf nodes
+                    const all = Array.from(document.querySelectorAll('span, div, p'));
+                    for (const el of all) {
+                        if (el.children.length === 0) {
+                            const t = (el.innerText || '').trim().toUpperCase();
+                            if (/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(t)) return t;
+                            if (/^[A-Z0-9]{8}$/.test(t)) return t.slice(0,4)+'-'+t.slice(4);
+                        }
+                    }
+                    return null;
+                }""")
+                if result:
+                    clean_r = re.sub(r'[^A-Z0-9]', '', result)
+                    p1, p2 = clean_r[:4], clean_r[4:]
+                    if (clean_r not in digits and
+                        p1 not in WORD_BLACKLIST and
+                        p2 not in WORD_BLACKLIST and
+                        not clean_r.isdigit()):
+                        code = result if '-' in result else f"{p1}-{p2}"
+                        logger.info(f"🎉 Code JS DOM: {code}")
+                        break
+            except:
+                pass
+
+            # ── Method 4: body text XXXX-XXXX (digit থাকা জরুরি) ──
+            try:
+                body_text = await page.evaluate("() => document.body.innerText")
+                if attempt % 5 == 0:
+                    logger.info(f"📄 Body: {body_text[:300]}")
+
+                for m in re.finditer(r'\b([A-Z0-9]{4})[- ]([A-Z0-9]{4})\b', body_text.upper()):
+                    p1, p2 = m.group(1), m.group(2)
+                    combined = p1 + p2
+                    if combined in digits or p1 in digits or p2 in digits:
+                        continue
+                    if combined.isdigit() or combined.isalpha():
+                        continue
+                    if p1 in WORD_BLACKLIST or p2 in WORD_BLACKLIST:
+                        continue
+                    code = f"{p1}-{p2}"
+                    logger.info(f"🎉 Code from body: {code}")
+                    break
+                if code:
+                    break
+            except:
+                pass
+
+        if not code:
+            try:
+                body = await page.evaluate("() => document.body.innerText")
+                logger.error(f"❌ Code not found. Body:\n{body[:2000]}")
+            except:
+                pass
+            raise Exception("Pairing code পাওয়া যায়নি। কিছুক্ষণ পর আবার try করো।")
+
+        return code
+
+    except Exception as e:
+        try: await browser.close()
+        except: pass
+        try: await pw_instance.stop()
+        except: pass
+        wa_sessions[uid] = {"browser": None, "page": None, "connected": False, "pw": None}
+        raise e
+
+
+async def check_wa_number(phone: str, user_id: str):
+    """Check if number has WhatsApp using connected WA Web session"""
+    uid = str(user_id)
+    sess = wa_sessions.get(uid, {})
+    if not sess.get("connected") or not sess.get("page"):
+        return None
+
+    page = sess["page"]
+    digits = re.sub(r"\D", "", phone)
+
+    try:
+        await page.goto(
+            f"https://web.whatsapp.com/send?phone={digits}",
+            wait_until="domcontentloaded",
+            timeout=20000
+        )
+        await asyncio.sleep(4)
+
+        body = await page.inner_text("body")
+        if "invalid" in body.lower() or "phone number shared" in body.lower():
+            return False
+
+        for sel in [
+            "div[data-testid='conversation-compose-box-input']",
+            "footer div[contenteditable='true']",
+            "div[contenteditable='true'][data-tab]",
+        ]:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=5000):
+                    return True
+            except: continue
+
+        return None
     except:
         return None
+
+
+
 
 # ─── Mail.tm API ───
 def mailtm_request(method: str, path: str, body=None, token=None):
@@ -513,45 +801,6 @@ async def get_email_message(msg_id: str, email_obj: dict) -> str:
     except:
         return ""
 
-
-# ─── WhatsApp Number Check ───
-async def check_whatsapp_exists(phone: str) -> str:
-    """
-    Check if a phone number is registered on WhatsApp.
-    Returns: 'yes' | 'no' | 'unknown'
-    """
-    digits = re.sub(r"\D", "", phone)
-    url = f"https://wa.me/{digits}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Mobile Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-            final_url = resp.geturl()
-            # WhatsApp returns page with open-app link if number is valid
-            if (
-                "open?phone" in final_url
-                or "send?phone" in final_url
-                or "wa.me/qr" in final_url
-                or '"phone"' in body
-                or "Open WhatsApp" in body
-                or digits in body
-            ):
-                return "yes"
-            if "not found" in body.lower() or "invalid" in body.lower():
-                return "no"
-            return "unknown"
-    except urllib.error.HTTPError as e:
-        if e.code in (404, 400):
-            return "no"
-        return "unknown"
-    except Exception as ex:
-        logger.error(f"WA check error: {ex}")
-        return "unknown"
-
 # ─── Membership Check ───
 async def check_membership(user_id: int, app) -> dict:
     result = {"mainChannel": False, "chatGroup": False, "otpGroup": False, "allJoined": False}
@@ -579,8 +828,8 @@ def main_keyboard():
     return ReplyKeyboardMarkup([
         ["☎️ Get Number", "📧 Get Tempmail"],
         ["🔐 2FA", "💰 Balances"],
-        ["📱 WA Check", "💸 Withdraw"],
-        ["💬 Support", "ℹ️ Help"]
+        ["💸 Withdraw", "💬 Support"],
+        ["ℹ️ Help"]
     ], resize_keyboard=True)
 
 def verify_keyboard():
@@ -873,18 +1122,16 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     svc     = services.get(svc_id, {"icon": "📞", "name": svc_id})
     price   = get_otp_price(cc)
 
-    nums_text = "\n".join(f"{i+1}. `+{n}`" for i, n in enumerate(nums))
-    msg = (
-        f"✅ *{len(nums)} Number(s) Assigned!*\n\n"
-        f"{svc['icon']} *Service:* {svc['name']}\n"
-        f"{country['flag']} *Country:* {country['name']}\n"
-        f"💵 *Earnings per OTP:* {price:.2f} taka\n\n"
-        f"📞 *Numbers:*\n{nums_text}\n\n"
-        f"📌 Use this number in the OTP Group.\n"
-        f"OTP will appear here automatically."
-    )
-
+    nums_text_lines = []
     wa_connected = uid in wa_sessions and wa_sessions[uid].get("connected")
+    for i, n in enumerate(nums):
+        if wa_connected:
+            result = await check_wa_number(n, uid)
+            icon = " ✅" if result is True else (" ❌" if result is False else " ⬜")
+        else:
+            icon = ""
+        nums_text_lines.append(f"{i+1}. `+{n}`{icon}")
+    nums_text = "\n".join(nums_text_lines)
     buttons = [
         [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
@@ -925,17 +1172,16 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country = countries.get(cc, {"flag": "🌍", "name": cc})
     svc     = services.get(svc_id, {"icon": "📞", "name": svc_id})
     price   = get_otp_price(cc)
-    nums_text = "\n".join(f"{i+1}. `+{n}`" for i, n in enumerate(nums))
-
-    msg = (
-        f"🔄 *{len(nums)} New Number(s)!*\n\n"
-        f"{svc['icon']} *Service:* {svc['name']}\n"
-        f"{country['flag']} *Country:* {country['name']}\n"
-        f"💵 *Earnings per OTP:* {price:.2f} taka\n\n"
-        f"📞 *Numbers:*\n{nums_text}\n\n"
-        f"📌 OTP will appear here automatically."
-    )
     wa_connected = uid in wa_sessions and wa_sessions[uid].get("connected")
+    nums_text_lines = []
+    for i, n in enumerate(nums):
+        if wa_connected:
+            result = await check_wa_number(n, uid)
+            icon = " ✅" if result is True else (" ❌" if result is False else " ⬜")
+        else:
+            icon = ""
+        nums_text_lines.append(f"{i+1}. `+{n}`{icon}")
+    nums_text = "\n".join(nums_text_lines)
     buttons = [
         [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
@@ -1146,78 +1392,58 @@ async def cb_wa_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = str(update.effective_user.id)
     sess = get_session(uid)
     sess["state"] = "wa_waiting_number"
-    await query.edit_message_text(
-        "📱 *WhatsApp Connect*\n\n"
-        "তোমার WhatsApp নম্বর দাও *(country code সহ)*:\n"
-        "Example: `8801712345678`\n\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "🔄 *আগে থেকে connected আছো?*\n"
-        "Railway restart হলে session মুছে যায়।\n"
-        "নিচের button চেপে reconnect করো:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ আমি Already Connected", callback_data="wa_already_connected")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="goto_main")],
-        ])
-    )
-
-async def cb_wa_already_connected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User confirms WhatsApp is already linked — just restore session in bot memory"""
-    query = update.callback_query
-    await query.answer("✅ Reconnected!")
-    uid  = str(update.effective_user.id)
-    sess = get_session(uid)
-    sess["state"] = "wa_already_connected_number"
-    await query.edit_message_text(
-        "📱 *Already Connected Confirm*\n\n"
-        "তোমার WhatsApp নম্বরটা দাও (country code সহ):\n"
-        "Example: `8801712345678`\n\n"
-        "_(এটা শুধু bot এর memory তে save হবে — "
-        "নতুন pairing code লাগবে না)_",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="goto_main")]
-        ])
-    )
-
-async def cb_wa_confirm_connected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("✅ Connected!")
-    uid = str(update.effective_user.id)
-    phone = (wa_sessions.get(uid) or {}).get("phone", "")
-    wa_sessions[uid] = {"connected": True, "pending": False, "phone": phone}
-    await query.edit_message_text(
-        f"✅ *WhatsApp Connected!*\n\n"
-        f"📞 Number: `+{phone}`\n\n"
-        f"Bot এর মাধ্যমে WhatsApp features ব্যবহার করতে পারবে।",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔴 Disconnect", callback_data="wa_disconnect")],
-        ])
+    await context.bot.send_message(
+        update.effective_user.id,
+        "📱 WhatsApp Connect\n\nতোমার WhatsApp নম্বর দাও (country code সহ):\nExample: 8801712345678"
     )
 
 async def cb_wa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    uid     = str(update.effective_user.id)
-    sess_wa = wa_sessions.get(uid, {})
-    conn    = sess_wa.get("connected", False)
-    phone   = sess_wa.get("phone", "")
+    uid   = str(update.effective_user.id)
+    sess  = wa_sessions.get(uid, {})
+    page  = sess.get("page")
 
-    if conn:
-        text = f"✅ *WhatsApp Connected!*\n\n📞 Number: `+{phone}`"
-        btns = [[InlineKeyboardButton("🔴 Disconnect", callback_data="wa_disconnect")]]
-    elif sess_wa.get("pending"):
-        text = "⏳ *Code enter করেছো?*\n\nWhatsApp এ code enter করার পর নিচের button চাপো।"
-        btns = [
-            [InlineKeyboardButton("✅ হ্যাঁ, Connected!", callback_data="wa_confirm_connected")],
-            [InlineKeyboardButton("🔄 New Code", callback_data="wa_connect")],
-        ]
-    else:
-        text = "🔴 *WhatsApp connected নেই।*"
-        btns = [[InlineKeyboardButton("📱 Connect", callback_data="wa_connect")]]
+    # Page আছে এবং WhatsApp Web loaded কিনা check করো
+    if page and not sess.get("connected"):
+        try:
+            # Language-independent DOM check — body text এর উপর নির্ভর না করে
+            is_conn = await page.evaluate("""() => {
+                // Chat list বা compose box DOM element থাকলে connected
+                const domSelectors = [
+                    '[data-testid="chat-list"]',
+                    '[data-testid="conversation-compose-box-input"]',
+                    '[data-testid="default-user"]',
+                    'div[contenteditable="true"]',
+                    '[data-icon="new-chat-outline"]',
+                    '#app [tabindex="-1"][role="application"]',
+                ];
+                for (const sel of domSelectors) {
+                    try { if (document.querySelector(sel)) return true; } catch(e) {}
+                }
+                // Body text fallback — English + Bengali + other common languages
+                const body = (document.body && document.body.innerText) || '';
+                const connKw = [
+                    'New chat', 'Status', 'Channels', 'Archived', 'Chats',
+                    'নতুন চ্যাট', 'চ্যাট', 'নতুন', 'Nouveau', 'Nuevo',
+                ];
+                for (const kw of connKw) {
+                    if (body.includes(kw)) return true;
+                }
+                return false;
+            }""")
+            if is_conn:
+                wa_sessions[uid]["connected"] = True
+                logger.info(f"✅ WA status check: connected detected for user {uid}")
+        except Exception as e:
+            logger.warning(f"WA status check error for {uid}: {e}")
 
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+    conn  = uid in wa_sessions and wa_sessions[uid].get("connected")
+    text  = "✅ WhatsApp connected!\n\nNumber assign হলে ✅/❌ দেখাবে।" if conn else "🔴 WhatsApp connected নেই।\n\nCode enter করার পরে আবার Check Status চাপো।"
+    btns  = [[InlineKeyboardButton("🔴 Disconnect", callback_data="wa_disconnect")]] if conn else \
+            [[InlineKeyboardButton("📱 New Connect", callback_data="wa_connect")],
+             [InlineKeyboardButton("🔄 Check Status Again", callback_data="wa_status")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(btns))
 
 async def cb_wa_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1427,26 +1653,6 @@ async def cb_totp_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # ─── Support & Help ───
-
-# ─── WhatsApp Number Check Handler ───
-async def handle_wa_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_verified(update, context):
-        return
-    uid  = str(update.effective_user.id)
-    sess = get_session(uid)
-    sess["state"] = "wa_check_input"
-    await update.message.reply_text(
-        "📱 *WhatsApp Number Check*\n\n"
-        "যে নম্বরটি চেক করতে চাও সেটি পাঠাও।\n"
-        "Country code সহ দাও।\n\n"
-        "📌 Example: `8801712345678`\n"
-        "📌 Example: `919876543210`",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="goto_main")]
-        ])
-    )
-
 async def handle_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💬 *Support*\n\nContact admin:\n📌 @sadhin8miya",
@@ -1998,32 +2204,7 @@ async def cb_del_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_goto_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    uid  = str(update.effective_user.id)
-    sess = get_session(uid)
-    sess["state"] = None
-    try:
-        await query.edit_message_text("✅ Done.", parse_mode="Markdown")
-    except:
-        pass
-
-async def cb_wa_check_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid  = str(update.effective_user.id)
-    sess = get_session(uid)
-    sess["state"] = "wa_check_input"
-    try:
-        await query.edit_message_text(
-            "📱 *WhatsApp Number Check*\n\n"
-            "চেক করতে চাও এমন নম্বর পাঠাও (country code সহ):\n"
-            "Example: `8801712345678`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="goto_main")]
-            ])
-        )
-    except:
-        pass
+    await query.edit_message_text("✅ Done.", parse_mode="Markdown")
 
 # ─── Document Handler (file upload) ───
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2094,82 +2275,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sess["is_admin"] = True
     state = sess.get("state")
 
-    # ── WhatsApp Check input ──
-    if state == "wa_check_input":
-        sess["state"] = None
-        phone = re.sub(r"\D", "", text)
-        if len(phone) < 10 or len(phone) > 15:
-            return await update.message.reply_text(
-                "❌ Invalid number. Country code সহ দাও।\nExample: `8801712345678`",
-                parse_mode="Markdown"
-            )
-        checking_msg = await update.message.reply_text(
-            f"🔍 *Checking* `+{phone}` *...*",
-            parse_mode="Markdown"
-        )
-        result = await check_whatsapp_exists(phone)
-        wa_link = f"https://wa.me/{phone}"
-        country = countries.get(
-            get_country_code_from_number(phone),
-            {"flag": "🌍", "name": "Unknown"}
-        )
-        if result == "yes":
-            status_text = "✅ *WhatsApp আছে!*"
-            status_icon = "✅"
-        elif result == "no":
-            status_text = "❌ *WhatsApp নেই*"
-            status_icon = "❌"
-        else:
-            status_text = "⚠️ *নিশ্চিত হওয়া যায়নি*"
-            status_icon = "⚠️"
-
-        try:
-            await checking_msg.delete()
-        except:
-            pass
-
-        await update.message.reply_text(
-            f"📱 *WhatsApp Check Result*\n\n"
-            f"📞 Number: `+{phone}`\n"
-            f"{country['flag']} Country: {country['name']}\n"
-            f"Status: {status_text}\n\n"
-            f"👇 নিজে verify করতে নিচের button চাপো:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{status_icon} Open in WhatsApp", url=wa_link)],
-                [InlineKeyboardButton("🔄 আরেকটি চেক করুন", callback_data="wa_check_more")],
-                [InlineKeyboardButton("🏠 Main Menu", callback_data="goto_main")],
-            ])
-        )
-        return
-
-
-    # ── WhatsApp already connected — just save number ──
-    if state == "wa_already_connected_number":
-        sess["state"] = None
-        phone = re.sub(r"\D", "", text)
-        if len(phone) < 10 or len(phone) > 15:
-            return await update.message.reply_text(
-                "❌ Invalid number. Example: `8801712345678`",
-                parse_mode="Markdown"
-            )
-        wa_sessions[uid] = {"connected": True, "pending": False, "phone": phone}
-        country = countries.get(
-            get_country_code_from_number(phone),
-            {"flag": "🌍", "name": "Unknown"}
-        )
-        await update.message.reply_text(
-            f"✅ *WhatsApp Reconnected!*\n\n"
-            f"📞 Number: `+{phone}`\n"
-            f"{country['flag']} Country: {country['name']}\n\n"
-            f"Bot এ WhatsApp session restore হয়েছে।",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔴 Disconnect", callback_data="wa_disconnect")],
-            ])
-        )
-        return
-
     # ── WhatsApp number input ──
     if state == "wa_waiting_number":
         sess["state"] = None
@@ -2178,60 +2283,98 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("❌ Invalid number. Example: `8801712345678`", parse_mode="Markdown")
 
         loading = await update.message.reply_text(
-            "⏳ *WhatsApp Web এ connect হচ্ছে...\n\n⌛ এটা ৩০-৬০ সেকেন্ড সময় নিতে পারে। অপেক্ষা করুন।",
+            "⏳ *WhatsApp Web এ connect হচ্ছে...*\n\n"
+            "⌛ এটা ৩০-৬০ সেকেন্ড সময় নিতে পারে। অপেক্ষা করুন।\n\n"
+            "✅ এই সময়ে bot এর অন্য features ব্যবহার করতে পারবে।",
             parse_mode="Markdown"
         )
-        try:
-            code = await get_wa_pairing_code(phone)
-            # Normalize: remove dashes then reformat as XXXX-XXXX
-            clean_code = re.sub(r"[^A-Z0-9]", "", code.upper())
-            if len(clean_code) >= 8:
-                formatted = clean_code[:4] + "-" + clean_code[4:8]
-            else:
-                formatted = code
-            # ── Code পেলেই connected=True সেট করো ──
-            wa_sessions[uid] = {
-                "connected": True,
-                "pending":   False,
-                "phone":     phone,
-            }
-            await loading.delete()
-            await update.message.reply_text(
-                f"🔑 *Pairing Code পেয়েছি!*\n\n"
-                f"`{formatted}`\n\n"
-                f"📋 *এখন এই steps follow করো:*\n"
-                f"1️⃣ WhatsApp খোলো\n"
-                f"2️⃣ Settings → Linked Devices\n"
-                f"3️⃣ *Link a device* চাপো\n"
-                f"4️⃣ *Link with phone number* চাপো\n"
-                f"5️⃣ উপরের code type করো\n\n"
-                f"✅ Code enter করলেই WhatsApp connected হয়ে যাবে।",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 New Code", callback_data="wa_connect")],
-                    [InlineKeyboardButton("🔴 Disconnect", callback_data="wa_disconnect")],
-                ])
-            )
-        except Exception as e:
-            logger.error(f"WA connect error: {e}")
-            err_msg = str(e)[:150].replace("*","").replace("`","").replace("_","")
+
+        # Background task এ চালাও — bot block হবে না
+        async def wa_connect_task():
             try:
-                await loading.delete()
-            except:
-                pass
-            try:
-                await update.message.reply_text(
-                    f"❌ *Pairing code পাওয়া যায়নি।*\n\n"
-                    f"সম্ভাব্য কারণ:\n"
-                    f"• Server এ Chromium install নেই\n"
-                    f"• WhatsApp Web load হয়নি\n"
-                    f"• Network timeout\n\n"
-                    f"Error: {err_msg}\n\n"
-                    f"কিছুক্ষণ পর আবার চেষ্টা করুন।",
-                    parse_mode="Markdown"
+                code = await get_wa_pairing_code(phone, uid)
+                clean_code = re.sub(r"[^A-Z0-9]", "", code.upper())
+                formatted = (clean_code[:4] + "-" + clean_code[4:8]) if len(clean_code) >= 8 else code
+                try: await loading.delete()
+                except: pass
+                await context.bot.send_message(
+                    uid,
+                    f"🔑 *Pairing Code*\n\n"
+                    f"`{formatted}`\n\n"
+                    f"📋 *Steps:*\n"
+                    f"1. WhatsApp খোলো\n"
+                    f"2. Settings → Linked Devices\n"
+                    f"3. Link a Device → *Link with phone number*\n"
+                    f"4. উপরের code enter করো\n\n"
+                    f"⏰ ৫ মিনিটের মধ্যে enter করো।",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Check Status", callback_data="wa_status")],
+                        [InlineKeyboardButton("🔄 New Code", callback_data="wa_connect")],
+                    ])
                 )
-            except:
-                pass
+
+                # Background auto-detect: user code enter করার পরে automatically connected detect করবে
+                async def auto_detect_connection():
+                    logger.info(f"🔄 Auto-detect started for user {uid}")
+                    for _ in range(60):  # 5 minutes max (60 × 5s)
+                        await asyncio.sleep(5)
+                        try:
+                            s = wa_sessions.get(uid, {})
+                            p = s.get("page")
+                            if not p or s.get("connected"):
+                                break
+                            is_conn = await p.evaluate("""() => {
+                                const domSelectors = [
+                                    '[data-testid="chat-list"]',
+                                    '[data-testid="conversation-compose-box-input"]',
+                                    '[data-testid="default-user"]',
+                                    'div[contenteditable="true"]',
+                                    '[data-icon="new-chat-outline"]',
+                                ];
+                                for (const sel of domSelectors) {
+                                    try { if (document.querySelector(sel)) return true; } catch(e) {}
+                                }
+                                const body = (document.body && document.body.innerText) || '';
+                                const connKw = ['New chat','Status','Channels','Archived','Chats','নতুন চ্যাট','চ্যাট'];
+                                for (const kw of connKw) {
+                                    if (body.includes(kw)) return true;
+                                }
+                                return false;
+                            }""")
+                            if is_conn:
+                                wa_sessions[uid]["connected"] = True
+                                logger.info(f"✅ Auto-detected WA connected for user {uid}")
+                                await context.bot.send_message(
+                                    uid,
+                                    "✅ *WhatsApp Connected!*\n\nসফলভাবে connect হয়েছে! এখন number check করতে পারবেন।",
+                                    parse_mode="Markdown",
+                                    reply_markup=InlineKeyboardMarkup([
+                                        [InlineKeyboardButton("🔴 Disconnect", callback_data="wa_disconnect")]
+                                    ])
+                                )
+                                break
+                        except Exception as e:
+                            logger.warning(f"Auto-detect loop error for {uid}: {e}")
+                            break
+                    logger.info(f"🔄 Auto-detect ended for user {uid}")
+
+                asyncio.create_task(auto_detect_connection())
+
+            except Exception as e:
+                try: await loading.delete()
+                except: pass
+                logger.error(f"WA error: {e}", exc_info=True)
+                await context.bot.send_message(
+                    uid,
+                    f"❌ *Connection failed:* {str(e)[:150]}\n\nকিছুক্ষণ পর আবার try করো।",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Try Again", callback_data="wa_connect")]
+                    ])
+                )
+
+        asyncio.create_task(wa_connect_task())
         return
 
     # ── TOTP secret input ──
@@ -2647,7 +2790,6 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🔐"), handle_2fa))
     app.add_handler(MessageHandler(filters.Regex("^💰 Balances$"), handle_balance))
     app.add_handler(MessageHandler(filters.Regex("^💸 Withdraw$"), handle_withdraw))
-    app.add_handler(MessageHandler(filters.Regex("^📱 WA Check$"), handle_wa_check))
     app.add_handler(MessageHandler(filters.Regex("^💬 Support$"), handle_support))
     app.add_handler(MessageHandler(filters.Regex("^ℹ️ Help$"), handle_help))
 
@@ -2668,12 +2810,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_withdraw_confirm, pattern="^w_confirm$"))
     app.add_handler(CallbackQueryHandler(cb_withdraw_history, pattern="^withdraw_history$"))
     app.add_handler(CallbackQueryHandler(cb_goto_main, pattern="^goto_main$"))
-    app.add_handler(CallbackQueryHandler(cb_wa_check_more, pattern="^wa_check_more$"))
 
     app.add_handler(CallbackQueryHandler(cb_wa_connect, pattern="^wa_connect$"))
     app.add_handler(CallbackQueryHandler(cb_wa_status, pattern="^wa_status$"))
-    app.add_handler(CallbackQueryHandler(cb_wa_confirm_connected, pattern="^wa_confirm_connected$"))
-    app.add_handler(CallbackQueryHandler(cb_wa_already_connected, pattern="^wa_already_connected$"))
     app.add_handler(CallbackQueryHandler(cb_wa_disconnect, pattern="^wa_disconnect$"))
 
     app.add_handler(CallbackQueryHandler(cb_tm_create, pattern="^tm_create$"))
