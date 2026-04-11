@@ -370,37 +370,37 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
         logger.info(f"✅ Phone btn click: {clicked}")
         await asyncio.sleep(3)
 
-        # Step 2: Phone number input — React-compatible fill
-        filled = await page.evaluate(f"""() => {{
-            const inputs = Array.from(document.querySelectorAll('input'));
-            for (const inp of inputs) {{
-                inp.focus();
-                // React native input value setter
-                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                setter.call(inp, '{digits}');
-                // React এর জন্য সব event fire করো
-                ['input', 'change', 'keyup', 'keydown'].forEach(ev => {{
-                    inp.dispatchEvent(new Event(ev, {{bubbles: true, cancelable: true}}));
-                }});
-                return true;
-            }}
-            return false;
-        }}""")
-        logger.info(f"✅ Input filled: {filled}")
-        await asyncio.sleep(1)
+        # Step 2: Country code dropdown + phone number input
+        await asyncio.sleep(2)
 
-        # Keyboard দিয়ে character by character type করো (React এর জন্য সবচেয়ে reliable)
+        # Country code dropdown clear করো এবং শুধু local number দাও
+        # Bangladesh: +880, local number = digits[3:] (880 বাদ দিয়ে)
+        # WhatsApp Web এ country code আলাদা dropdown এ থাকে
+        country_prefix = ""
+        local_number = digits
+        # Common country codes
+        for prefix in ["880", "91", "92", "1", "44", "977"]:
+            if digits.startswith(prefix):
+                country_prefix = prefix
+                local_number = digits[len(prefix):]
+                break
+
+        logger.info(f"📱 Country: +{country_prefix}, Local: {local_number}")
+
+        # Phone input এ শুধু local number type করো
         try:
             inp_el = page.locator('input').first
-            await inp_el.wait_for(state="visible", timeout=5000)
+            await inp_el.wait_for(state="visible", timeout=8000)
             await inp_el.click()
-            await inp_el.fill("")
-            await asyncio.sleep(0.3)
-            for ch in digits:
-                await inp_el.type(ch, delay=100)
-            logger.info(f"✅ Typed digit by digit: {digits}")
+            # আগের সব clear করো
+            await inp_el.press("Control+a")
+            await inp_el.press("Backspace")
+            await asyncio.sleep(0.5)
+            # Local number type করো
+            await inp_el.type(local_number, delay=120)
+            logger.info(f"✅ Typed: {local_number}")
         except Exception as te:
-            logger.info(f"⚠️ Type fallback: {te}")
+            logger.warning(f"⚠️ Input error: {te}")
         await asyncio.sleep(2)
 
         # Step 3: Next button — সব possible উপায়ে click
