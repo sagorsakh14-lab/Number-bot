@@ -674,112 +674,106 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
         raise e
 
 
+
 async def check_wa_number(phone: str, user_id: str):
-    """Check if number has WhatsApp — JS-based fast detection with popup cleanup"""
-    uid = str(user_id)
+    uid  = str(user_id)
     sess = wa_sessions.get(uid, {})
     if not sess.get("connected") or not sess.get("page"):
         return None
 
-    page = sess["page"]
+    page   = sess["page"]
     digits = re.sub(r"\D", "", phone)
 
-    try:
-        # ── Step 1: আগের যেকোনো popup/dialog বন্ধ করো ──
+    async def go_home():
         try:
-            await page.evaluate("""() => {
-                // Close button খুঁজে click করো
-                const closeBtns = Array.from(document.querySelectorAll(
-                    "[data-testid='popup-controls'] button, " +
-                    "[data-testid='alert-dialog'] button, " +
-                    "div[role='dialog'] button"
-                ));
-                for (const btn of closeBtns) {
-                    const txt = (btn.innerText || '').toLowerCase();
-                    if (txt.includes('ok') || txt.includes('close') || txt.includes('cancel')) {
-                        btn.click();
-                        break;
-                    }
-                }
-                // Escape key ও চাপো
-                document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
-            }""")
-            await asyncio.sleep(0.5)
+            await page.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
         except:
             pass
 
-        # ── Step 2: Number check URL এ navigate করো ──
+    async def is_session_alive():
+        try:
+            return await page.evaluate("""() => !!(
+                document.querySelector("[data-testid='chat-list']") ||
+                document.querySelector("[data-icon='new-chat-outline']") ||
+                document.querySelector("[data-testid='default-user']") ||
+                (document.querySelector("div[contenteditable='true']") &&
+                 !document.querySelector("[data-testid='popup-contents']"))
+            )""")
+        except:
+            return False
+
+    async def dismiss_popup():
+        try:
+            await page.evaluate("""() => {
+                const btn = document.querySelector(
+                    "[data-testid='popup-controls'] button, " +
+                    "[data-testid='alert-dialog'] button"
+                );
+                if (btn) btn.click();
+            }""")
+            await asyncio.sleep(0.3)
+        except:
+            pass
+
+    try:
+        # Step 1: session alive কিনা check
+        alive = await is_session_alive()
+        if not alive:
+            await go_home()
+            await asyncio.sleep(3)
+            alive = await is_session_alive()
+            if not alive:
+                wa_sessions[uid]["connected"] = False
+                logger.warning(f"WA session dead for {uid}")
+                return None
+
+        # Step 2: number URL এ যাও
         await page.goto(
             f"https://web.whatsapp.com/send?phone={digits}",
             wait_until="domcontentloaded",
             timeout=20000
         )
 
-        # ── Step 3: JS দিয়ে DOM check — max 12 seconds ──
-        for attempt in range(60):  # 60 × 0.2s = 12s
+        # Step 3: result আসা পর্যন্ত wait
+        result = None
+        for _ in range(70):
             await asyncio.sleep(0.2)
-
-            result = await page.evaluate("""() => {
-                // ── 1. Invalid number popup check ──
-                const popupEl = document.querySelector("[data-testid='popup-contents']");
-                if (popupEl && popupEl.offsetParent !== null) {
-                    const txt = (popupEl.innerText || '').toLowerCase();
-                    if (txt.length > 0) return 'invalid';
-                }
-
-                // ── 2. Alert dialog check ──
-                const alertEl = document.querySelector("[data-testid='alert-dialog']");
-                if (alertEl && alertEl.offsetParent !== null) {
+            state = await page.evaluate("""() => {
+                if (document.querySelector("[data-testid='conversation-compose-box-input']"))
+                    return 'valid';
+                if (document.querySelector("div[contenteditable='true'][data-tab]"))
+                    return 'valid';
+                const p = document.querySelector("[data-testid='popup-contents']");
+                if (p && p.offsetParent !== null && (p.innerText||'').length > 3)
                     return 'invalid';
-                }
-
-                // ── 3. Compose box = valid number ──
-                const compose = document.querySelector(
-                    "[data-testid='conversation-compose-box-input']"
-                );
-                if (compose && compose.offsetParent !== null) return 'valid';
-
-                // ── 4. Contenteditable fallback ──
-                const editable = document.querySelector(
-                    "div[contenteditable='true'][data-tab]"
-                );
-                if (editable && editable.offsetParent !== null) return 'valid';
-
-                // ── 5. Still loading? ──
+                if (document.querySelector("[data-testid='alert-dialog']"))
+                    return 'invalid';
                 return 'loading';
             }""")
 
-            if result == "valid":
-                logger.info(f"✅ WA check: +{digits} → HAS WhatsApp")
-                return True
-            elif result == "invalid":
-                logger.info(f"❌ WA check: +{digits} → NO WhatsApp (fresh)")
-                # Popup dismiss করো পরের check এর জন্য
-                try:
-                    await page.evaluate("""() => {
-                        const btns = Array.from(document.querySelectorAll(
-                            "[data-testid='popup-controls'] button, " +
-                            "[data-testid='alert-dialog'] button"
-                        ));
-                        if (btns.length > 0) btns[0].click();
-                    }""")
-                    await asyncio.sleep(0.3)
-                except:
-                    pass
-                return False
-            # else: still loading — continue loop
+            if state == "valid":
+                result = True
+                logger.info(f"📱 +{digits} HAS WhatsApp")
+                break
+            elif state == "invalid":
+                result = False
+                logger.info(f"✅ +{digits} Fresh/No WA")
+                await dismiss_popup()
+                break
 
-        logger.warning(f"⬜ WA check: +{digits} → timeout")
-        return None  # timeout
+        # Step 4: CRITICAL — main page এ ফিরে আসো
+        await go_home()
+
+        return result
 
     except Exception as e:
-        logger.warning(f"WA check error for +{digits}: {e}")
+        logger.warning(f"WA check error +{digits}: {e}")
+        await go_home()
         return None
 
 
 
-
-# ─── Mail.tm API ───
 def mailtm_request(method: str, path: str, body=None, token=None):
     url = f"https://api.mail.tm{path}"
     headers = {
@@ -1163,7 +1157,7 @@ async def build_numbers_message(svc_id, cc, nums, wa_status_map=None):
     for i, n in enumerate(nums):
         if wa_status_map is not None:
             st = wa_status_map.get(n)
-            icon = " 📱" if st is True else (" ✅" if st is False else "")
+            icon = " 📱" if st is True else (" ✅" if st is False else " 🔄")
         else:
             icon = ""
         lines.append(f"{i+1}. `+{n}`{icon}")
@@ -1951,7 +1945,6 @@ async def cb_admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not get_session(uid)["is_admin"] and not is_admin(uid):
         return await query.answer("❌ Admin only")
     await query.answer()
-
     await query.edit_message_text(
         f"⚙️ *Bot Settings*\n\n"
         f"📞 Number Count: *{settings['defaultNumberCount']}*\n"
