@@ -304,9 +304,10 @@ def generate_totp(secret: str):
 # ─── Green API (WhatsApp) Helpers ───
 
 # ─── Green API Global State ───
-# Single shared instance — সব user এর জন্য একই WA number
-_green_state      = {"authorized": False}   # cached state
-_wa_pair_lock     = None                    # initialized in post_init
+# Single shared instance — একটাই WhatsApp connect থাকে
+_green_state  = {"authorized": False}  # cached authorization state
+_green_owner  = {"uid": None}          # কোন user এর WhatsApp connect আছে
+_wa_pair_lock = None                   # initialized lazily
 
 def green_request(method: str, endpoint: str, body=None) -> dict:
     """Synchronous Green API HTTP call (thread-safe, blocking)"""
@@ -329,44 +330,46 @@ async def green_get_state() -> str:
 
 async def green_api_monitor(app):
     """
-    Global background task — Green API state পর্যবেক্ষণ করো।
-    Logout হলে সব connected user কে notify করো।
+    Background task — Green API state পর্যবেক্ষণ।
+    Logout হলে শুধু যার WhatsApp connect ছিল তাকেই notify করো।
     """
     logger.info("🟢 Green API monitor started")
     while True:
         await asyncio.sleep(30)
         try:
-            state        = await green_get_state()
-            was_auth     = _green_state.get("authorized", False)
-            is_auth      = (state == "authorized")
+            state    = await green_get_state()
+            was_auth = _green_state.get("authorized", False)
+            is_auth  = (state == "authorized")
 
             if was_auth and not is_auth:
-                # ── Logged out ──
+                # ── Logout detected ──
                 _green_state["authorized"] = False
-                logger.warning("⚠️ Green API: WhatsApp logged out!")
-                # সব connected user কে notify করো
-                for uid in list(wa_sessions.keys()):
-                    if wa_sessions.get(uid, {}).get("connected"):
-                        wa_sessions.pop(uid, None)
-                        try:
-                            await app.bot.send_message(
-                                int(uid),
-                                "⚠️ *WhatsApp Disconnected!*\n\n"
-                                "WhatsApp থেকে logout হয়েছে।\n"
-                                "আবার connect করতে নিচের button চাপো।",
-                                parse_mode="Markdown",
-                                reply_markup=InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")
-                                ]])
-                            )
-                        except:
-                            pass
+                owner_uid = _green_owner.get("uid")
+                logger.warning(f"⚠️ Green API: WhatsApp logged out! owner={owner_uid}")
+
+                # শুধু যার WhatsApp ছিল তাকেই notify করো
+                if owner_uid:
+                    wa_sessions.pop(str(owner_uid), None)
+                    _green_owner["uid"] = None
+                    try:
+                        await app.bot.send_message(
+                            int(owner_uid),
+                            "⚠️ *WhatsApp Disconnected!*\n\n"
+                            "তোমার WhatsApp থেকে bot logout হয়েছে।\n"
+                            "আবার connect করতে নিচের button চাপো।",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")
+                            ]])
+                        )
+                    except Exception as e:
+                        logger.error(f"Logout notify error: {e}")
+                else:
+                    wa_sessions.clear()
 
             elif not was_auth and is_auth:
-                # ── Reconnected ──
                 _green_state["authorized"] = True
                 logger.info("✅ Green API: WhatsApp authorized")
-
             elif is_auth:
                 _green_state["authorized"] = True
 
@@ -406,17 +409,18 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
 async def monitor_wa_connection(uid: str, context):
     """
     Pairing এর পর Green API state poll করো।
-    Authorized হলে user কে notify করো।
+    Authorized হলে user কে notify এবং owner হিসেবে track করো।
     """
     logger.info(f"🔍 Waiting for WA auth: {uid}")
-    for _ in range(60):       # max 5 minutes
+    for _ in range(60):
         await asyncio.sleep(5)
         try:
             state = await green_get_state()
             if state == "authorized":
                 _green_state["authorized"] = True
-                wa_sessions[uid] = {"connected": True}
-                logger.info(f"✅ WA connected: {uid}")
+                _green_owner["uid"]        = uid
+                wa_sessions[uid]           = {"connected": True}
+                logger.info(f"✅ WA connected: uid={uid}")
                 try:
                     await context.bot.send_message(
                         uid,
@@ -433,12 +437,9 @@ async def monitor_wa_connection(uid: str, context):
 async def check_wa_number(phone: str, user_id: str):
     """
     Green API checkWhatsapp — pure HTTP request।
-    ১০০+ concurrent call একসাথে handle করতে পারে।
-    কোনো lock নেই, কোনো shared state নেই।
+    Lock নেই — ১০০+ concurrent call একসাথে handle করতে পারে।
     """
-    # Global authorized state check (cached — API call নয়)
     if not _green_state.get("authorized"):
-        # Cache miss হলে একবার fresh check
         state = await green_get_state()
         if state != "authorized":
             return None
@@ -459,7 +460,6 @@ async def check_wa_number(phone: str, user_id: str):
     except Exception as e:
         logger.warning(f"check_wa_number error +{digits}: {e}")
         return None
-
 
 # ─── Mail.tm API ───
 def mailtm_request(method: str, path: str, body=None, token=None):
