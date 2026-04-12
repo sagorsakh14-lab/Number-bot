@@ -325,38 +325,73 @@ def green_request(method: str, endpoint: str, body=None) -> dict:
         logger.error(f"Green API error [{endpoint}]: {e}")
         return {}
 
-async def green_get_state() -> str:
-    """authorized / notAuthorized / blocked / sleepMode"""
+async def green_get_state():
+    """
+    authorized / notAuthorized / blocked / sleepMode
+    API call fail হলে None return করে — false logout trigger এড়াতে।
+    """
     loop   = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, lambda: green_request("GET", "getStateInstance"))
-    return result.get("stateInstance", "notAuthorized")
+    if not result or "stateInstance" not in result:
+        return None   # API error — state unknown, skip এই cycle
+    return result["stateInstance"]
 
 async def green_api_monitor(app):
     """
     Background task — Green API state পর্যবেক্ষণ।
     Startup এ immediately state check করে _green_state set করে।
     Logout হলে শুধু যার WhatsApp connect ছিল তাকেই notify করো।
+    API call fail হলে (None) cycle skip করে — false logout এড়ায়।
     """
     logger.info("🟢 Green API monitor started")
 
     # ── Startup: current state জেনে নাও ──
     try:
         init_state = await green_get_state()
-        _green_state["authorized"] = (init_state == "authorized")
         logger.info(f"🟢 Green API initial state: {init_state}")
 
-        # যদি authorized এবং owner আছে — session restore করো
-        if init_state == "authorized" and _green_owner.get("uid"):
-            owner = str(_green_owner["uid"])
-            wa_sessions[owner] = {"connected": True}
-            logger.info(f"🔄 WA session restored for uid={owner}")
+        if init_state == "authorized":
+            _green_state["authorized"] = True
+            # যদি authorized এবং owner আছে — session restore করো
+            if _green_owner.get("uid"):
+                owner = str(_green_owner["uid"])
+                wa_sessions[owner] = {"connected": True}
+                logger.info(f"🔄 WA session restored for uid={owner}")
+        elif init_state is not None:
+            # বট বন্ধ থাকার সময় logout হয়েছিল — owner কে notify করো
+            _green_state["authorized"] = False
+            owner_uid = _green_owner.get("uid")
+            if owner_uid:
+                logger.warning(f"⚠️ WA was logged out while bot was offline. Notifying owner={owner_uid}")
+                wa_sessions.pop(str(owner_uid), None)
+                _green_owner["uid"] = None
+                save_green_owner()
+                try:
+                    await app.bot.send_message(
+                        int(owner_uid),
+                        "⚠️ *WhatsApp Disconnected!*\n\n"
+                        "বট বন্ধ থাকার সময় তোমার WhatsApp থেকে logout হয়েছে।\n"
+                        "আবার connect করতে নিচের button চাপো।",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")
+                        ]])
+                    )
+                except Exception as e:
+                    logger.error(f"Startup logout notify error: {e}")
     except Exception as e:
         logger.error(f"Green API initial check error: {e}")
 
     while True:
         await asyncio.sleep(30)
         try:
-            state    = await green_get_state()
+            state = await green_get_state()
+
+            # API call fail → None → এই cycle skip করো (false logout এড়াও)
+            if state is None:
+                logger.warning("⚠️ Green API returned no state — skipping this cycle")
+                continue
+
             was_auth = _green_state.get("authorized", False)
             is_auth  = (state == "authorized")
 
@@ -1230,18 +1265,28 @@ async def cb_wa_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_wa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("⏳ Checking...")
-    uid   = str(update.effective_user.id)
+    uid = str(update.effective_user.id)
 
     # Green API থেকে real-time state নাও
     try:
         state = await green_get_state()
     except:
-        state = "notAuthorized"
+        state = None
+
+    # API error হলে cached state ব্যবহার করো
+    if state is None:
+        state = "authorized" if _green_state.get("authorized") else "notAuthorized"
 
     conn = (state == "authorized")
     if conn:
+        _green_state["authorized"] = True
+        # যদি owner না থাকে, এই user কে owner করো
+        if not _green_owner.get("uid"):
+            _green_owner["uid"] = uid
+            save_green_owner()
         wa_sessions[uid] = {"connected": True}
     else:
+        _green_state["authorized"] = False
         wa_sessions.pop(uid, None)
 
     STATE_MAP = {
@@ -1259,8 +1304,24 @@ async def cb_wa_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid = str(update.effective_user.id)
+
+    # wa_sessions থেকে সরাও
     wa_sessions.pop(uid, None)
-    await context.bot.send_message(uid, "🔴 *WhatsApp disconnected.*", parse_mode="Markdown")
+
+    # Global state ও owner clear করো
+    _green_state["authorized"] = False
+    if _green_owner.get("uid") == uid:
+        _green_owner["uid"] = None
+        save_green_owner()
+        logger.info(f"🔴 WA manually disconnected by uid={uid}")
+
+    await query.edit_message_text(
+        "🔴 *WhatsApp Disconnected.*\n\nআবার connect করতে নিচের button চাপো।",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")
+        ]])
+    )
 
 # ─── Temp Mail ───
 async def handle_tempmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
