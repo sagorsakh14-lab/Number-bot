@@ -409,22 +409,27 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
     logger.info(f"📱 Green API pairing for: +{digits}")
 
     async with _wa_pair_lock:
-        loop   = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: green_request("POST", "getAuthorizationCode", {"phoneNumber": int(digits)})
-        )
-        logger.info(f"Green API pairing result: {result}")
-        if result.get("status") is True and result.get("code"):
-            code  = str(result["code"])
-            clean = re.sub(r"[^A-Z0-9]", "", code.upper())
-            if len(clean) >= 8:
-                return f"{clean[:4]}-{clean[4:8]}"
-            return code
-        raise Exception(
-            result.get("message") or
-            "Pairing code পাওয়া যায়নি। কিছুক্ষণ পর আবার try করো।"
-        )
+        loop = asyncio.get_event_loop()
+
+        # Pairing code নাও — ৩ বার try করো
+        last_err = "Pairing code পাওয়া যায়নি। কিছুক্ষণ পর আবার try করো।"
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(3)
+            result = await loop.run_in_executor(
+                None,
+                lambda: green_request("POST", "getAuthorizationCode", {"phoneNumber": digits})
+            )
+            logger.info(f"Green API pairing result (attempt {attempt+1}): {result}")
+            if result.get("status") is True and result.get("code"):
+                code  = str(result["code"])
+                clean = re.sub(r"[^A-Z0-9]", "", code.upper())
+                if len(clean) >= 8:
+                    return f"{clean[:4]}-{clean[4:8]}"
+                return code
+            last_err = result.get("message") or last_err
+
+        raise Exception(last_err)
 
 async def monitor_wa_connection(uid: str, context):
     """
@@ -2548,7 +2553,14 @@ async def scheduled_membership_check(app):
 
 # ─── Main ───
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
