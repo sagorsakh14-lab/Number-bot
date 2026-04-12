@@ -514,28 +514,26 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
         # ─── Step 4: Pairing Code Extraction ───
         code = None
 
-        # WA pairing code সবসময় digit+letter mix থাকে, pure alphabetic হয় না
-        # এই function দিয়ে valid code check করবো
+        # WA pairing code সবসময় 8 char alphanumeric (XXXX-YYYY format)
+        # Pure alphabetic হতে পারে — digit requirement নেই
         def is_valid_pairing_code(p1: str, p2: str) -> bool:
             combined = p1 + p2
-            # Phone number এর অংশ হলে বাদ
-            if combined in digits or combined in digits[-8:]:
+            if len(combined) != 8:
                 return False
-            # Pure digits হলে বাদ
+            # Phone number এর অংশ হলে বাদ
+            if combined in digits or digits.endswith(combined) or combined in digits[-8:]:
+                return False
+            # Pure digits হলে বাদ (phone number fragment)
             if combined.isdigit():
                 return False
-            # Pure alphabetic হলে বাদ — WA code এ সবসময় digit থাকে
-            if combined.isalpha():
-                return False
-            # অন্তত ২টা digit থাকতে হবে
-            digit_count = sum(1 for c in combined if c.isdigit())
-            if digit_count < 2:
+            # কমপক্ষে একটা letter থাকতে হবে
+            if not any(c.isalpha() for c in combined):
                 return False
             return True
 
-        for attempt in range(60):  # max 120 seconds
+        for attempt in range(90):  # max 180 seconds — WhatsApp slow হতে পারে
             await asyncio.sleep(2)
-            logger.info(f"🔍 Code scan {attempt+1}/60")
+            logger.info(f"🔍 Code scan {attempt+1}/90")
 
             # ── Method 1: data-testid — সবচেয়ে reliable ──
             try:
@@ -552,22 +550,32 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
             except:
                 pass
 
-            # ── Method 2: Individual character boxes ──
+            # ── Method 2: Individual character boxes (separator সহ) ──
             try:
                 chars = await page.evaluate("""() => {
+                    // Single char span/div খোঁজো — separator dash বাদ দিয়ে
                     const containers = Array.from(document.querySelectorAll('div, section'));
                     for (const container of containers) {
-                        const allSpans = Array.from(container.querySelectorAll('span, div'));
-                        const charSpans = allSpans.filter(el => {
+                        const allEls = Array.from(container.querySelectorAll('span, div'));
+                        const charEls = allEls.filter(el => {
                             if (el.children.length > 0) return false;
                             const t = (el.innerText || el.textContent || '').trim();
                             return /^[A-Z0-9]$/i.test(t);
                         });
-                        if (charSpans.length === 8) {
-                            return charSpans.map(el =>
-                                (el.innerText || el.textContent || '').trim().toUpperCase()
-                            ).join('');
+                        // 8 char (code) অথবা 9+ যেখানে separator আছে
+                        if (charEls.length === 8 || charEls.length === 9) {
+                            const chars = charEls
+                                .map(el => (el.innerText || el.textContent || '').trim().toUpperCase())
+                                .filter(t => /^[A-Z0-9]$/.test(t));
+                            if (chars.length === 8) return chars.join('');
                         }
+                    }
+                    // ── Method 2b: aria-label বা data-* তে code ──
+                    const codeEls = document.querySelectorAll('[aria-label*="code" i], [data-code], [class*="code" i]');
+                    for (const el of codeEls) {
+                        const t = re = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+                        const clean = t.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+                        if (clean.length === 8) return clean;
                     }
                     return null;
                 }""")
@@ -580,22 +588,48 @@ async def get_wa_pairing_code(phone: str, user_id: str) -> str:
             except:
                 pass
 
-            # ── Method 3: body text — digit requirement strict ──
+            # ── Method 3: body text — relaxed pattern ──
             try:
                 body_text = await page.evaluate("() => document.body.innerText")
                 if attempt % 5 == 0:
                     logger.info(f"📄 Body: {body_text[:300]}")
 
+                # Pattern 1: XXXX-YYYY বা XXXX YYYY
                 for m in re.finditer(r'\b([A-Z0-9]{4})[- ]([A-Z0-9]{4})\b', body_text.upper()):
                     p1, p2 = m.group(1), m.group(2)
                     if is_valid_pairing_code(p1, p2):
                         code = f"{p1}-{p2}"
-                        logger.info(f"🎉 Code body: {code}")
+                        logger.info(f"🎉 Code body pattern1: {code}")
                         break
+
+                # Pattern 2: 8 consecutive alphanumeric (no separator)
+                if not code:
+                    for m in re.finditer(r'\b([A-Z][A-Z0-9]{3})([A-Z0-9]{4})\b', body_text.upper()):
+                        p1, p2 = m.group(1), m.group(2)
+                        if is_valid_pairing_code(p1, p2):
+                            code = f"{p1}-{p2}"
+                            logger.info(f"🎉 Code body pattern2: {code}")
+                            break
+
                 if code:
                     break
             except:
                 pass
+
+            # ── Method 4: page HTML scan — last resort ──
+            if attempt % 10 == 9:  # প্রতি ২০ সেকেন্ডে একবার
+                try:
+                    html = await page.evaluate("() => document.body.innerHTML")
+                    for m in re.finditer(r'["\'>]([A-Z0-9]{4})-([A-Z0-9]{4})["\' <]', html.upper()):
+                        p1, p2 = m.group(1), m.group(2)
+                        if is_valid_pairing_code(p1, p2):
+                            code = f"{p1}-{p2}"
+                            logger.info(f"🎉 Code HTML: {code}")
+                            break
+                    if code:
+                        break
+                except:
+                    pass
 
         if not code:
             try:
