@@ -891,6 +891,15 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price   = get_otp_price(cc)
 
     wa_connected = _green_state.get("authorized", False)
+    # Cache miss হলে real-time check
+    if not wa_connected:
+        try:
+            real_state = await green_get_state()
+            wa_connected = (real_state == "authorized")
+            _green_state["authorized"] = wa_connected
+        except:
+            wa_connected = False
+
     nums_text = "\n".join(
         f"{i+1}. `+{n}`" + (" ⏳" if wa_connected else "")
         for i, n in enumerate(nums)
@@ -923,8 +932,9 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if wa_connected:
         chat_id = query.message.chat_id
         msg_id  = query.message.message_id
+        _buttons = buttons  # closure fix
+        _make_msg = make_msg
         async def do_wa_check():
-            # সব number একসাথে parallel check করো
             results = await asyncio.gather(
                 *[check_wa_number(n, uid) for n in nums],
                 return_exceptions=True
@@ -937,10 +947,11 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             try:
                 await context.bot.edit_message_text(
-                    make_msg(updated), chat_id=chat_id, message_id=msg_id,
-                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+                    _make_msg(updated), chat_id=chat_id, message_id=msg_id,
+                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(_buttons)
                 )
-            except: pass
+            except Exception as e:
+                logger.warning(f"do_wa_check edit error: {e}")
         asyncio.create_task(do_wa_check())
 
 async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
