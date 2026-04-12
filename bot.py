@@ -61,7 +61,7 @@ TEMP_MAILS_FILE    = os.path.join(DATA_DIR, "temp_mails.json")
 EARNINGS_FILE      = os.path.join(DATA_DIR, "earnings.json")
 WITHDRAW_FILE      = os.path.join(DATA_DIR, "withdrawals.json")
 COUNTRY_PRICES_FILE= os.path.join(DATA_DIR, "country_prices.json")
-WA_SESSIONS_DIR    = os.path.join(DATA_DIR, "wa_sessions")
+WA_OWNER_FILE      = os.path.join(DATA_DIR, "wa_owner.json")
 
 # ─── Default Settings ───
 DEFAULT_SETTINGS = {
@@ -306,8 +306,11 @@ def generate_totp(secret: str):
 # ─── Green API Global State ───
 # Single shared instance — একটাই WhatsApp connect থাকে
 _green_state  = {"authorized": False}  # cached authorization state
-_green_owner  = {"uid": None}          # কোন user এর WhatsApp connect আছে
+_green_owner  = load_json(WA_OWNER_FILE, {"uid": None})  # bot restart এর পরেও owner মনে থাকে
 _wa_pair_lock = None                   # initialized lazily
+
+def save_green_owner():
+    save_json(WA_OWNER_FILE, _green_owner)
 
 def green_request(method: str, endpoint: str, body=None) -> dict:
     """Synchronous Green API HTTP call (thread-safe, blocking)"""
@@ -331,9 +334,25 @@ async def green_get_state() -> str:
 async def green_api_monitor(app):
     """
     Background task — Green API state পর্যবেক্ষণ।
+    Startup এ immediately state check করে _green_state set করে।
     Logout হলে শুধু যার WhatsApp connect ছিল তাকেই notify করো।
     """
     logger.info("🟢 Green API monitor started")
+
+    # ── Startup: current state জেনে নাও ──
+    try:
+        init_state = await green_get_state()
+        _green_state["authorized"] = (init_state == "authorized")
+        logger.info(f"🟢 Green API initial state: {init_state}")
+
+        # যদি authorized এবং owner আছে — session restore করো
+        if init_state == "authorized" and _green_owner.get("uid"):
+            owner = str(_green_owner["uid"])
+            wa_sessions[owner] = {"connected": True}
+            logger.info(f"🔄 WA session restored for uid={owner}")
+    except Exception as e:
+        logger.error(f"Green API initial check error: {e}")
+
     while True:
         await asyncio.sleep(30)
         try:
@@ -351,6 +370,7 @@ async def green_api_monitor(app):
                 if owner_uid:
                     wa_sessions.pop(str(owner_uid), None)
                     _green_owner["uid"] = None
+                    save_green_owner()
                     try:
                         await app.bot.send_message(
                             int(owner_uid),
@@ -419,6 +439,7 @@ async def monitor_wa_connection(uid: str, context):
             if state == "authorized":
                 _green_state["authorized"] = True
                 _green_owner["uid"]        = uid
+                save_green_owner()
                 wa_sessions[uid]           = {"connected": True}
                 logger.info(f"✅ WA connected: uid={uid}")
                 try:
