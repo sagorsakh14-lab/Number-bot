@@ -890,7 +890,15 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     svc     = services.get(svc_id, {"icon": "📞", "name": svc_id})
     price   = get_otp_price(cc)
 
-    wa_connected = _green_state.get("authorized", False)
+    # Real-time Green API state check
+    try:
+        real_state = await green_get_state()
+        wa_connected = (real_state == "authorized")
+        _green_state["authorized"] = wa_connected
+    except:
+        wa_connected = False
+        _green_state["authorized"] = False
+
     nums_text = "\n".join(
         f"{i+1}. `+{n}`" + (" ⏳" if wa_connected else "")
         for i, n in enumerate(nums)
@@ -924,7 +932,6 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = query.message.chat_id
         msg_id  = query.message.message_id
         async def do_wa_check():
-            # সব number একসাথে parallel check করো
             results = await asyncio.gather(
                 *[check_wa_number(n, uid) for n in nums],
                 return_exceptions=True
