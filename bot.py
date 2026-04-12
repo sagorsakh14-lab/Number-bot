@@ -774,9 +774,9 @@ async def monitor_wa_connection(uid: str, context):
             logout_fail_count = 0
             continue
 
-        # task সবে শেষ হয়েছে? ৩০s cooldown দাও — page এখনো load হচ্ছে হতে পারে
+        # task সবে শেষ হয়েছে? ৬০s cooldown দাও — page এখনো load হচ্ছে হতে পারে
         last_done = wa_last_check_done.get(uid, 0)
-        if time.time() - last_done < 30:
+        if time.time() - last_done < 60:
             logger.info(f"⏭️ WA logout check skipped (cooldown after check) uid={uid}")
             logout_fail_count = 0
             continue
@@ -791,7 +791,7 @@ async def monitor_wa_connection(uid: str, context):
                     wait_until="domcontentloaded",
                     timeout=15000
                 )
-                await asyncio.sleep(5)
+                await asyncio.sleep(8)  # page পুরো load হতে দাও
                 still_connected = await is_wa_connected(page)
         except Exception as e:
             logger.warning(f"WA logout monitor check error uid={uid}: {e}")
@@ -805,8 +805,9 @@ async def monitor_wa_connection(uid: str, context):
         logout_fail_count += 1
         logger.warning(f"⚠️ WA possibly logged out, uid={uid}, fail={logout_fail_count}")
 
-        # ২ বার consecutive fail = logout confirm (~৯০ সেকেন্ডের মধ্যে notify)
-        if logout_fail_count >= 2:
+        # ৩ বার consecutive fail = logout confirm
+        # (বেশি থ্রেশহোল্ড = false positive কমে, real logout ধরতে ~3 মিনিট লাগে)
+        if logout_fail_count >= 3:
             wa_sessions[uid]["connected"] = False
             logger.info(f"🔴 WA logged out confirmed: uid={uid}")
             try:
