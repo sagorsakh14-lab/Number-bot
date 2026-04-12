@@ -471,7 +471,7 @@ async def check_wa_number(phone: str, user_id: str):
     try:
         result = await loop.run_in_executor(
             None,
-            lambda: green_request("POST", "checkWhatsapp", {"phoneNumber": int(digits)})
+            lambda: green_request("POST", "checkWhatsapp", {"phoneNumber": digits})
         )
         logger.info(f"📱 WA check +{digits}: {result}")
         exists = result.get("existsWhatsapp")
@@ -890,15 +890,7 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     svc     = services.get(svc_id, {"icon": "📞", "name": svc_id})
     price   = get_otp_price(cc)
 
-    # Real-time Green API state check
-    try:
-        real_state = await green_get_state()
-        wa_connected = (real_state == "authorized")
-        _green_state["authorized"] = wa_connected
-    except:
-        wa_connected = False
-        _green_state["authorized"] = False
-
+    wa_connected = _green_state.get("authorized", False)
     nums_text = "\n".join(
         f"{i+1}. `+{n}`" + (" ⏳" if wa_connected else "")
         for i, n in enumerate(nums)
@@ -932,6 +924,7 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = query.message.chat_id
         msg_id  = query.message.message_id
         async def do_wa_check():
+            # সব number একসাথে parallel check করো
             results = await asyncio.gather(
                 *[check_wa_number(n, uid) for n in nums],
                 return_exceptions=True
@@ -1003,9 +996,7 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
         [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
     ]
-    if wa_connected:
-        buttons.append([InlineKeyboardButton("🔴 WA Logout", callback_data="wa_disconnect")])
-    else:
+    if not wa_connected:
         buttons.append([InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")])
 
     await query.edit_message_text(make_msg_new(nums_text), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
@@ -1231,46 +1222,11 @@ async def cb_wa_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid  = str(update.effective_user.id)
-
-    # আগে current state check করো
-    try:
-        cur_state = await green_get_state()
-    except:
-        cur_state = "notAuthorized"
-
-    if cur_state == "authorized":
-        owner_uid = _green_owner.get("uid")
-        if owner_uid and str(owner_uid) != str(uid):
-            # অন্য কেউ connect করেছে
-            return await query.edit_message_text(
-                "⚠️ *WhatsApp Already Connected!*\n\n"
-                "অন্য একজন ইতিমধ্যে connect করেছে।\n"
-                "নতুন connection এর জন্য admin এর সাথে যোগাযোগ করো।",
-                parse_mode="Markdown"
-            )
-        else:
-            # নিজেই আগে connect করেছিল — disconnect option দেখাও
-            return await query.edit_message_text(
-                "✅ *WhatsApp Already Connected!*\n\n"
-                "তোমার WhatsApp ইতিমধ্যে connected আছে।\n"
-                "নতুন নম্বর দিয়ে connect করতে আগে disconnect করো।",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔴 Disconnect", callback_data="wa_disconnect")],
-                    [InlineKeyboardButton("📊 Check Status", callback_data="wa_status")],
-                ])
-            )
-
     sess = get_session(uid)
     sess["state"] = "wa_waiting_number"
-    await query.edit_message_text(
-        "📱 *WhatsApp Connect*\n\n"
-        "তোমার WhatsApp নম্বর দাও (country code সহ):\n"
-        "Example: `8801712345678`",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Cancel", callback_data="goto_main")
-        ]])
+    await context.bot.send_message(
+        update.effective_user.id,
+        "📱 WhatsApp Connect\n\nতোমার WhatsApp নম্বর দাও (country code সহ):\nExample: 8801712345678"
     )
 
 async def cb_wa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1301,51 +1257,12 @@ async def cb_wa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
            [[InlineKeyboardButton("📱 Connect", callback_data="wa_connect")]]
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
 
-async def green_logout() -> bool:
-    """Green API থেকে WhatsApp logout করো (actual device unlink)"""
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: green_request("GET", "logout")
-    )
-    logger.info(f"Green API logout result: {result}")
-    return result.get("isLogout", False) or result.get("stateInstance") == "notAuthorized"
-
 async def cb_wa_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("⏳ Disconnecting...")
+    await query.answer()
     uid = str(update.effective_user.id)
-
-    # শুধু owner-ই disconnect করতে পারবে
-    owner_uid = _green_owner.get("uid")
-    if owner_uid and str(owner_uid) != str(uid):
-        return await query.edit_message_text(
-            "❌ *তুমি এই WhatsApp এর owner নও।*",
-            parse_mode="Markdown"
-        )
-
-    # Green API তে actual logout
-    try:
-        await green_logout()
-    except Exception as e:
-        logger.error(f"Green API logout error: {e}")
-
-    # State clear করো
-    _green_state["authorized"] = False
-    wa_sessions.pop(str(uid), None)
-    if _green_owner.get("uid") == uid:
-        _green_owner["uid"] = None
-        save_green_owner()
-
-    await query.edit_message_text(
-        "🔴 *WhatsApp Disconnected!*\n\n"
-        "তোমার WhatsApp bot থেকে unlink হয়েছে।\n"
-        "আবার connect করতে নিচের button চাপো।",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")
-        ]])
-    )
+    wa_sessions.pop(uid, None)
+    await context.bot.send_message(uid, "🔴 *WhatsApp disconnected.*", parse_mode="Markdown")
 
 # ─── Temp Mail ───
 async def handle_tempmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2185,16 +2102,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         async def wa_task():
             try:
-                # যদি আগে থেকেই authorized থাকে, আগে logout করো
-                cur_state = await green_get_state()
-                if cur_state == "authorized":
-                    logger.info("📱 WA already authorized — logging out before pairing")
-                    try:
-                        await green_logout()
-                        await asyncio.sleep(3)  # logout settle হওয়ার জন্য অপেক্ষা
-                    except Exception as le:
-                        logger.warning(f"Pre-pairing logout error: {le}")
-
                 code = await get_wa_pairing_code(phone, uid)
                 clean_code = re.sub(r"[^A-Z0-9]", "", code.upper())
                 formatted = (clean_code[:4] + "-" + clean_code[4:8]) if len(clean_code) >= 8 else code
