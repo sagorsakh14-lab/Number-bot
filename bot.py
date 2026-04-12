@@ -711,6 +711,17 @@ async def check_wa_number(phone: str, user_id: str):
                 await asyncio.sleep(3)
 
             result = await page.evaluate("""() => {
+                // ── Login/Pairing screen detect ──
+                const LOGIN_SELS = [
+                    '[data-testid="link-device-phone-num-code"]',
+                    '[data-testid="link-device-phone-num-button"]',
+                    '[data-testid="link-with-phone-number"]',
+                    'canvas[aria-label]',
+                    '[data-testid="qrcode"]',
+                ];
+                const isLoginPage = LOGIN_SELS.some(s => !!document.querySelector(s));
+                if (isLoginPage) return 'LOGGED_OUT';
+
                 const ERROR_WORDS = [
                     'invalid', 'not on whatsapp', 'unable',
                     'phone number shared', 'not registered',
@@ -742,6 +753,44 @@ async def check_wa_number(phone: str, user_id: str):
                 }
                 return null;
             }""")
+
+            # ── বারবার retry করে LOGGED_OUT confirm ──
+            if result == 'LOGGED_OUT':
+                # Page load এ momentarily login UI দেখা যেতে পারে, তাই 3s wait করে recheck
+                await asyncio.sleep(3)
+                recheck = await page.evaluate("""() => {
+                    const LOGIN_SELS = [
+                        '[data-testid="link-device-phone-num-code"]',
+                        '[data-testid="link-device-phone-num-button"]',
+                        '[data-testid="link-with-phone-number"]',
+                        'canvas[aria-label]',
+                        '[data-testid="qrcode"]',
+                    ];
+                    const CHAT_SELS = [
+                        'footer [contenteditable]',
+                        '[data-testid="conversation-compose-box-input"]',
+                        '[data-testid="side"]',
+                        '[data-testid="chat-list"]',
+                        'div#side',
+                    ];
+                    const isLogin = LOGIN_SELS.some(s => !!document.querySelector(s));
+                    const isChat  = CHAT_SELS.some(s => !!document.querySelector(s));
+                    if (isChat) return 'CONNECTED';
+                    if (isLogin) return 'LOGGED_OUT';
+                    return 'UNKNOWN';
+                }""")
+                logger.info(f"🔄 WA recheck for uid={uid}: {recheck}")
+                if recheck == 'LOGGED_OUT':
+                    wa_sessions[uid]["connected"] = False
+                    logger.warning(f"⚠️ WA session confirmed logged out for uid={uid}")
+                    return None
+                elif recheck == 'UNKNOWN':
+                    # UNKNOWN মানে page এখনও load হচ্ছে, connected ধরে রাখো
+                    logger.info(f"⚠️ WA recheck UNKNOWN, treating as connected uid={uid}")
+                    return None
+                else:
+                    # CONNECTED — false alarm ছিল
+                    result = True
 
             logger.info(f"📱 WA check +{digits}: {result}")
             return result
@@ -1195,22 +1244,28 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def do_wa_check():
             res = {}
             for n in nums:
-                res[n] = await check_wa_number(n, uid)
-            # সব check শেষে main WA Web এ ফিরে যাও
-            try:
-                p = wa_sessions.get(uid, {}).get("page")
-                if p:
-                    await p.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=15000)
-            except:
-                pass
+                r = await check_wa_number(n, uid)
+                res[n] = r
+                # session logged out হলে বাকি check বন্ধ
+                if not wa_sessions.get(uid, {}).get("connected"):
+                    break
+            # ⚠️ navigate back to whatsapp.com করা হয় না — headless mode এ
+            # root URL navigate করলে session reset হয়ে pairing screen আসে
             updated = "\n".join(
                 f"{i+1}. `+{n}`" + (" 📱" if res.get(n) is True else (" ❌" if res.get(n) is False else " ⬜"))
                 for i, n in enumerate(nums)
             )
+            still_connected = wa_sessions.get(uid, {}).get("connected", False)
+            final_buttons = buttons if still_connected else [
+                [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
+                [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
+                [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
+                [InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")],
+            ]
             try:
                 await context.bot.edit_message_text(
                     make_msg(updated), chat_id=chat_id, message_id=msg_id,
-                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(final_buttons)
                 )
             except: pass
         asyncio.create_task(do_wa_check())
@@ -1279,22 +1334,28 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def do_wa_check_new():
             res = {}
             for n in nums:
-                res[n] = await check_wa_number(n, uid)
-            # সব check শেষে main WA Web এ ফিরে যাও
-            try:
-                p = wa_sessions.get(uid, {}).get("page")
-                if p:
-                    await p.goto("https://web.whatsapp.com/", wait_until="domcontentloaded", timeout=15000)
-            except:
-                pass
+                r = await check_wa_number(n, uid)
+                res[n] = r
+                # session logged out হলে বাকি check বন্ধ
+                if not wa_sessions.get(uid, {}).get("connected"):
+                    break
+            # ⚠️ navigate back to whatsapp.com করা হয় না — headless mode এ
+            # root URL navigate করলে session reset হয়ে pairing screen আসে
             updated = "\n".join(
                 f"{i+1}. `+{n}`" + (" 📱" if res.get(n) is True else (" ❌" if res.get(n) is False else " ⬜"))
                 for i, n in enumerate(nums)
             )
+            still_connected = wa_sessions.get(uid, {}).get("connected", False)
+            final_buttons_new = buttons if still_connected else [
+                [InlineKeyboardButton("📨 Open OTP Group", url=OTP_GROUP)],
+                [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
+                [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
+                [InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")],
+            ]
             try:
                 await context.bot.edit_message_text(
                     make_msg_new(updated), chat_id=chat_id, message_id=msg_id,
-                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(final_buttons_new)
                 )
             except: pass
         asyncio.create_task(do_wa_check_new())
