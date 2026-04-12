@@ -1320,7 +1320,9 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
         [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
     ]
-    if not wa_connected:
+    if wa_connected:
+        buttons.append([InlineKeyboardButton("🔴 WA Logout", callback_data="wa_disconnect")])
+    else:
         buttons.append([InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")])
 
     await query.edit_message_text(make_msg(nums_text), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
@@ -1403,7 +1405,9 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 Get New Numbers", callback_data=f"newnum:{svc_id}:{cc}")],
         [InlineKeyboardButton("🔙 Service List", callback_data="back_services")],
     ]
-    if not wa_connected:
+    if wa_connected:
+        buttons.append([InlineKeyboardButton("🔴 WA Logout", callback_data="wa_disconnect")])
+    else:
         buttons.append([InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")])
 
     await query.edit_message_text(make_msg_new(nums_text), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
@@ -1683,10 +1687,35 @@ async def cb_wa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_wa_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("🔴 Disconnecting...")
     uid = str(update.effective_user.id)
+    # Browser বন্ধ করো
+    sess = wa_sessions.get(uid, {})
+    if sess.get("browser"):
+        try: await sess["browser"].close()
+        except: pass
+    if sess.get("pw"):
+        try: await sess["pw"].stop()
+        except: pass
     wa_sessions.pop(uid, None)
-    await context.bot.send_message(uid, "🔴 *WhatsApp disconnected.*", parse_mode="Markdown")
+    cancel_wa_check(uid)
+    try:
+        await query.edit_message_text(
+            "🔴 *WhatsApp Disconnected.*\n\nআবার connect করতে নিচের বাটন চাপো:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")]
+            ])
+        )
+    except:
+        await context.bot.send_message(
+            uid,
+            "🔴 *WhatsApp Disconnected.*\n\nআবার connect করতে 📱 Connect WhatsApp চাপো:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")]
+            ])
+        )
 
 # ─── Temp Mail ───
 async def handle_tempmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
