@@ -303,8 +303,13 @@ def generate_totp(secret: str):
 
 # ─── Green API (WhatsApp) Helpers ───
 
+# ─── Green API Global State ───
+# Single shared instance — সব user এর জন্য একই WA number
+_green_state      = {"authorized": False}   # cached state
+_wa_pair_lock     = None                    # initialized in post_init
+
 def green_request(method: str, endpoint: str, body=None) -> dict:
-    """Synchronous Green API HTTP call"""
+    """Synchronous Green API HTTP call (thread-safe, blocking)"""
     url     = f"{GREEN_API_URL}/waInstance{GREEN_INSTANCE}/{endpoint}/{GREEN_TOKEN}"
     headers = {"Content-Type": "application/json"}
     data    = json.dumps(body).encode() if body else None
@@ -322,40 +327,101 @@ async def green_get_state() -> str:
     result = await loop.run_in_executor(None, lambda: green_request("GET", "getStateInstance"))
     return result.get("stateInstance", "notAuthorized")
 
+async def green_api_monitor(app):
+    """
+    Global background task — Green API state পর্যবেক্ষণ করো।
+    Logout হলে সব connected user কে notify করো।
+    """
+    logger.info("🟢 Green API monitor started")
+    while True:
+        await asyncio.sleep(30)
+        try:
+            state        = await green_get_state()
+            was_auth     = _green_state.get("authorized", False)
+            is_auth      = (state == "authorized")
+
+            if was_auth and not is_auth:
+                # ── Logged out ──
+                _green_state["authorized"] = False
+                logger.warning("⚠️ Green API: WhatsApp logged out!")
+                # সব connected user কে notify করো
+                for uid in list(wa_sessions.keys()):
+                    if wa_sessions.get(uid, {}).get("connected"):
+                        wa_sessions.pop(uid, None)
+                        try:
+                            await app.bot.send_message(
+                                int(uid),
+                                "⚠️ *WhatsApp Disconnected!*\n\n"
+                                "WhatsApp থেকে logout হয়েছে।\n"
+                                "আবার connect করতে নিচের button চাপো।",
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup([[
+                                    InlineKeyboardButton("📱 Connect WhatsApp", callback_data="wa_connect")
+                                ]])
+                            )
+                        except:
+                            pass
+
+            elif not was_auth and is_auth:
+                # ── Reconnected ──
+                _green_state["authorized"] = True
+                logger.info("✅ Green API: WhatsApp authorized")
+
+            elif is_auth:
+                _green_state["authorized"] = True
+
+        except Exception as e:
+            logger.error(f"green_api_monitor error: {e}")
+
 async def get_wa_pairing_code(phone: str, user_id: str) -> str:
-    """Green API phone-number link → pairing code"""
+    """
+    Green API phone-number pairing code।
+    Global lock: একসাথে একজনই pairing করতে পারবে।
+    """
+    global _wa_pair_lock
+    if _wa_pair_lock is None:
+        _wa_pair_lock = asyncio.Lock()
+
     digits = re.sub(r"\D", "", phone)
     logger.info(f"📱 Green API pairing for: +{digits}")
-    loop   = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: green_request("POST", "getAuthorizationCode", {"phoneNumber": int(digits)})
-    )
-    logger.info(f"Green API pairing result: {result}")
-    if result.get("status") is True and result.get("code"):
-        code = str(result["code"])
-        # Format: XXXX-XXXX
-        clean = re.sub(r"[^A-Z0-9]", "", code.upper())
-        if len(clean) >= 8:
-            return f"{clean[:4]}-{clean[4:8]}"
-        return code
-    raise Exception(result.get("message") or "Pairing code পাওয়া যায়নি। কিছুক্ষণ পর আবার try করো।")
+
+    async with _wa_pair_lock:
+        loop   = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: green_request("POST", "getAuthorizationCode", {"phoneNumber": int(digits)})
+        )
+        logger.info(f"Green API pairing result: {result}")
+        if result.get("status") is True and result.get("code"):
+            code  = str(result["code"])
+            clean = re.sub(r"[^A-Z0-9]", "", code.upper())
+            if len(clean) >= 8:
+                return f"{clean[:4]}-{clean[4:8]}"
+            return code
+        raise Exception(
+            result.get("message") or
+            "Pairing code পাওয়া যায়নি। কিছুক্ষণ পর আবার try করো।"
+        )
 
 async def monitor_wa_connection(uid: str, context):
-    """Background এ Green API state poll করো"""
-    logger.info(f"🔍 Green API monitor started for {uid}")
-    for _ in range(60):  # max 5 minutes (60 × 5s)
+    """
+    Pairing এর পর Green API state poll করো।
+    Authorized হলে user কে notify করো।
+    """
+    logger.info(f"🔍 Waiting for WA auth: {uid}")
+    for _ in range(60):       # max 5 minutes
         await asyncio.sleep(5)
         try:
             state = await green_get_state()
-            logger.info(f"Green API state: {state}")
             if state == "authorized":
+                _green_state["authorized"] = True
                 wa_sessions[uid] = {"connected": True}
-                logger.info(f"✅ WA connected (Green API): {uid}")
+                logger.info(f"✅ WA connected: {uid}")
                 try:
                     await context.bot.send_message(
                         uid,
-                        "✅ *WhatsApp Connected!*\n\nএখন numbers assign হলে WA check দেখাবে।",
+                        "✅ *WhatsApp Connected!*\n\n"
+                        "এখন numbers assign হলে WA check দেখাবে।",
                         parse_mode="Markdown"
                     )
                 except:
@@ -366,16 +432,17 @@ async def monitor_wa_connection(uid: str, context):
 
 async def check_wa_number(phone: str, user_id: str):
     """
-    Green API checkWhatsapp endpoint দিয়ে number check।
-    প্রতিটা call ~0.5 সেকেন্ড — Playwright এর চেয়ে ১০০x দ্রুত।
+    Green API checkWhatsapp — pure HTTP request।
+    ১০০+ concurrent call একসাথে handle করতে পারে।
+    কোনো lock নেই, কোনো shared state নেই।
     """
-    uid  = str(user_id)
-    # Global Green API state check — যেকোনো user এর connected থাকলে চলবে
-    state = await green_get_state()
-    if state != "authorized":
-        # Fallback: user session এ connected থাকলেও চলবে
-        if not wa_sessions.get(uid, {}).get("connected"):
+    # Global authorized state check (cached — API call নয়)
+    if not _green_state.get("authorized"):
+        # Cache miss হলে একবার fresh check
+        state = await green_get_state()
+        if state != "authorized":
             return None
+        _green_state["authorized"] = True
 
     digits = re.sub(r"\D", "", phone)
     loop   = asyncio.get_event_loop()
@@ -386,14 +453,13 @@ async def check_wa_number(phone: str, user_id: str):
         )
         logger.info(f"📱 WA check +{digits}: {result}")
         exists = result.get("existsWhatsapp")
-        if exists is True:
-            return True
-        if exists is False:
-            return False
+        if exists is True:  return True
+        if exists is False: return False
         return None
     except Exception as e:
         logger.warning(f"check_wa_number error +{digits}: {e}")
         return None
+
 
 # ─── Mail.tm API ───
 def mailtm_request(method: str, path: str, body=None, token=None):
@@ -803,7 +869,7 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     svc     = services.get(svc_id, {"icon": "📞", "name": svc_id})
     price   = get_otp_price(cc)
 
-    wa_connected = uid in wa_sessions and wa_sessions[uid].get("connected")
+    wa_connected = _green_state.get("authorized", False)
     nums_text = "\n".join(
         f"{i+1}. `+{n}`" + (" ⏳" if wa_connected else "")
         for i, n in enumerate(nums)
@@ -835,9 +901,13 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = query.message.chat_id
         msg_id  = query.message.message_id
         async def do_wa_check():
-            res = {}
-            for n in nums:
-                res[n] = await check_wa_number(n, uid)
+            # সব number একসাথে parallel check করো
+            results = await asyncio.gather(
+                *[check_wa_number(n, uid) for n in nums],
+                return_exceptions=True
+            )
+            res = {n: (r if not isinstance(r, Exception) else None)
+                   for n, r in zip(nums, results)}
             updated = "\n".join(
                 f"{i+1}. `+{n}`" + (" 📱" if res.get(n) is True else (" ❌" if res.get(n) is False else " ⬜"))
                 for i, n in enumerate(nums)
@@ -880,7 +950,7 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country = countries.get(cc, {"flag": "🌍", "name": cc})
     svc     = services.get(svc_id, {"icon": "📞", "name": svc_id})
     price   = get_otp_price(cc)
-    wa_connected = uid in wa_sessions and wa_sessions[uid].get("connected")
+    wa_connected = _green_state.get("authorized", False)
 
     nums_text = "\n".join(
         f"{i+1}. `+{n}`" + (" ⏳" if wa_connected else "")
@@ -912,9 +982,13 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = query.message.chat_id
         msg_id  = query.message.message_id
         async def do_wa_check_new():
-            res = {}
-            for n in nums:
-                res[n] = await check_wa_number(n, uid)
+            # সব number একসাথে parallel check করো
+            results = await asyncio.gather(
+                *[check_wa_number(n, uid) for n in nums],
+                return_exceptions=True
+            )
+            res = {n: (r if not isinstance(r, Exception) else None)
+                   for n, r in zip(nums, results)}
             updated = "\n".join(
                 f"{i+1}. `+{n}`" + (" 📱" if res.get(n) is True else (" ❌" if res.get(n) is False else " ⬜"))
                 for i, n in enumerate(nums)
@@ -2529,9 +2603,10 @@ def main():
     # Private text handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_text))
 
-    # Start scheduled task
+    # Start scheduled tasks
     async def post_init(application):
         asyncio.create_task(scheduled_membership_check(application))
+        asyncio.create_task(green_api_monitor(application))
 
     app.post_init = post_init
 
