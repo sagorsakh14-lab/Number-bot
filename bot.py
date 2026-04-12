@@ -795,10 +795,10 @@ async def check_wa_number(phone: str, user_id: str):
             await page.goto(
                 f"https://web.whatsapp.com/send?phone={digits}",
                 wait_until="domcontentloaded",
-                timeout=20000
+                timeout=12000
             )
 
-            # Step 1: Footer compose box অথবা error popup — max 12 সেকেন্ড wait
+            # Chat input অথবা error popup — max 6 সেকেন্ড wait
             try:
                 await page.wait_for_selector(
                     'footer [contenteditable], '
@@ -807,14 +807,13 @@ async def check_wa_number(phone: str, user_id: str):
                     '[data-testid="popup-contents"], '
                     '[role="alertdialog"], '
                     'div[role="dialog"]',
-                    timeout=12000
+                    timeout=6000
                 )
             except:
-                await asyncio.sleep(4)
+                await asyncio.sleep(2)
 
-            # Step 2: Error popup আসার জন্য extra 2s wait
-            # (number invalid হলে compose box আগে দেখা যায়, তারপর popup আসে)
-            await asyncio.sleep(2)
+            # Error popup আসার জন্য 1s wait
+            await asyncio.sleep(1)
 
             result = await page.evaluate("""() => {
                 // ── Login/Pairing screen detect ──
@@ -1334,21 +1333,23 @@ async def cb_select_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def do_wa_check():
             res = {}
             for n in nums:
-                r = await check_wa_number(n, uid)
-                res[n] = r
-            # ⚠️ navigate back করা হয় না — root URL navigate করলে session reset হয়
-            updated = "\n".join(
-                f"{i+1}. `+{n}`" + (" 📱" if res.get(n) is True else (" ❌" if res.get(n) is False else " ⬜"))
-                for i, n in enumerate(nums)
-            )
-            # শুরুতে wa_connected True ছিল, check শেষেও same buttons রাখো
-            # (check চলাকালীন session state পরিবর্তন হলেও user কে disconnect বলা হবে না)
-            try:
-                await context.bot.edit_message_text(
-                    make_msg(updated), chat_id=chat_id, message_id=msg_id,
-                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+                res[n] = await check_wa_number(n, uid)
+                # প্রতিটা check শেষে সাথে সাথে update করো
+                live_text = "\n".join(
+                    f"{i+1}. `+{n}`" + (
+                        " 📱" if res.get(n) is True else
+                        " ❌" if res.get(n) is False else
+                        " ✅" if n in res else
+                        " ⏳"
+                    )
+                    for i, n in enumerate(nums)
                 )
-            except: pass
+                try:
+                    await context.bot.edit_message_text(
+                        make_msg(live_text), chat_id=chat_id, message_id=msg_id,
+                        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+                    )
+                except: pass
         cancel_wa_check(uid)
         wa_check_tasks[uid] = asyncio.create_task(do_wa_check())
 
@@ -1418,21 +1419,23 @@ async def cb_new_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def do_wa_check_new():
             res = {}
             for n in nums:
-                r = await check_wa_number(n, uid)
-                res[n] = r
-            # ⚠️ navigate back করা হয় না — root URL navigate করলে session reset হয়
-            updated = "\n".join(
-                f"{i+1}. `+{n}`" + (" 📱" if res.get(n) is True else (" ❌" if res.get(n) is False else " ⬜"))
-                for i, n in enumerate(nums)
-            )
-            still_connected = wa_sessions.get(uid, {}).get("connected", False)
-            # শুরুতে wa_connected True ছিল, check শেষেও same buttons রাখো
-            try:
-                await context.bot.edit_message_text(
-                    make_msg_new(updated), chat_id=chat_id, message_id=msg_id,
-                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+                res[n] = await check_wa_number(n, uid)
+                # প্রতিটা check শেষে সাথে সাথে update করো
+                live_text = "\n".join(
+                    f"{i+1}. `+{n}`" + (
+                        " 📱" if res.get(n) is True else
+                        " ❌" if res.get(n) is False else
+                        " ✅" if n in res else
+                        " ⏳"
+                    )
+                    for i, n in enumerate(nums)
                 )
-            except: pass
+                try:
+                    await context.bot.edit_message_text(
+                        make_msg_new(live_text), chat_id=chat_id, message_id=msg_id,
+                        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+                    )
+                except: pass
         cancel_wa_check(uid)
         wa_check_tasks[uid] = asyncio.create_task(do_wa_check_new())
 
